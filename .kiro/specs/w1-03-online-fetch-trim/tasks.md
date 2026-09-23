@@ -1,0 +1,316 @@
+# 实施计划：外网获取类功能裁剪
+
+> spec：`w1-03-online-fetch-trim` ｜ 波次：Wave 1 ｜ 基线：`757fd12` ｜ 预估：18 人日
+> 前置：`w0-01-fork-migration-namespace`、`w0-02-ci-gates`、`w0-03-test-auth-baseline`、`w0-04-fork-isolation-points`、`w1-02-capability-trim` ｜ 全局约束：`.kiro/steering/intranet-transformation.md`
+
+每个顶层任务完成后可独立提交；提交前运行任务内的验证命令。
+
+约定：
+
+- 括号里是人日估算。
+- 每个删除任务先把自己负责的 token 与路由加进任务 2 建立的两个守卫测试，让守卫变红，再做删除让它变绿。token 在"最后一处出现被删掉"的那个任务里加入。
+- 任务 4-5（自更新）、6-10（技能与专家）、12-13（模型）、14-16（TLS）的后端与前端提交，应当在同一个 PR 中合入 fork 主干，避免主干上出现"前端调用已删接口"的中间态。
+- 全程不修改 `src/octop/i18n/{en,zh}.json` 与 `dashboard/src/locales/{en,zh}.json`；新文案只写进两对 overlay。
+- 改依赖的提交在末尾执行 `make relock`。
+
+- [ ] 1. 确认前置 spec 已合入并记录基线（0.25 人日）
+  - 改动：无代码改动。确认以下前置均已在当前分支：
+    - `w0-01`：`src/octop/infra/db/fork_migrate.py` 中有 `run_fork_migrations`、`set_fork_version`、`_FORK_PY_STEPS`；
+    - `w0-02`：`make check-frontend`、`make test-postgresql`；
+    - `w0-03`：`tests/support/auth.py::all_permission_keys`；
+    - `w0-04`：`src/octop/i18n/intranet/{en,zh}.json`、`dashboard/src/locales/intranet/{en,zh}.json`、`make relock`、`CHANGELOG-intranet.md`、`docs/api-intranet.md`；
+    - `w1-02`：已合入，其 `CHANGELOG-intranet.md` 条目存在。
+  - 改动：检查 `w1-02` 是否已提供按 JSON 数组改写权限键的通用步骤函数（`rg -n "def rewrite_permission_keys|_FORK_PY_STEPS\[" src/octop/infra/db`）。有就在任务 4 中复用，并在 PR 描述里写明。
+  - 改动：执行 `export W103_BASE=$(git rev-parse HEAD)`，把该值与下列命令中既有的失败用例（例如环境相关的失败）记入 PR 描述。
+  - 验证：`rg -n "def run_fork_migrations|def set_fork_version|_FORK_PY_STEPS" src/octop/infra/db/fork_migrate.py && test -f src/octop/i18n/intranet/en.json && test -f dashboard/src/locales/intranet/en.json && test -f CHANGELOG-intranet.md && test -f docs/api-intranet.md && make -n relock >/dev/null && git rev-parse HEAD`
+  - 验证：`make install-frontend && uv run pytest tests/unit/api/test_acl_gate_coverage.py tests/unit/i18n tests/unit/infra/setup tests/unit/skills tests/unit/test_plugin_manager.py tests/unit/agents/test_onnx_service.py tests/integration/test_skills_api.py tests/integration/test_skill_packages_api.py tests/integration/test_experts_api.py tests/integration/test_onnx_models_api.py -q`
+  - _需求：12.4_
+
+- [ ] 2. 建立两个守卫测试的空骨架（0.25 人日）
+  - 改动：新增 `tests/unit/test_online_fetch_tokens_removed.py`（fork 自有）。
+    - `_REMOVED_TOKENS: tuple[str, ...] = ()`。
+    - `_scan(roots, suffixes, excluded)` 用 `pathlib.Path.rglob` 遍历，以 `encoding="utf-8", errors="replace"` 读取，返回 `(相对路径, token)` 列表。
+    - 扫描范围：`src/octop` 下的 `*.py`、`*.md`、`*.sh`，排除 `src/octop/infra/agents/experts/library/` 与 `src/octop/infra/agents/subagents/library/`；`dashboard/src` 下的 `*.ts`、`*.tsx`。
+    - 另写一个自检用例：在 `tmp_path` 下放一个含探针字符串的文件，确认 `_scan` 能命中。
+  - 改动：新增 `tests/unit/api/test_online_fetch_removed_routes.py`（fork 自有）。
+    - 定义 `_REMOVED_ROUTES: frozenset[tuple[str, str]] = frozenset()`、`_ADDED_ROUTES` 同样为空、`_COMPANION_REMOVED_PATHS: frozenset[str] = frozenset()`。
+    - 仿照 `tests/unit/api/test_openapi_meta.py`：先 `write_octop_config(tmp_octop_home, enable_api_docs=True)`，再启动 `OctopServer` 并 `build_app`。
+    - 收集 `app.routes` 中 `APIRoute` 的 `(path, method)` 与 `/api/openapi.json` 的 `paths` 键（按 method 展开）；断言 `_REMOVED_ROUTES` 与两者都不相交，`_ADDED_ROUTES` 是两者的子集；断言 `build_http_companion_app(https_port=443).routes` 的路径与 `_COMPANION_REMOVED_PATHS` 不相交。
+  - 验证：`uv run pytest tests/unit/test_online_fetch_tokens_removed.py tests/unit/api/test_online_fetch_removed_routes.py -q`
+  - _需求：12.1, 12.2_
+
+- [ ] 3. 新增服务控制路由与 service_control 权限键（与旧 update 并存，0.75 人日）
+  - [ ] 3.1 先写会失败的用例
+    - 改动：新增 `tests/unit/api/test_service_control_router.py`，从 `tests/unit/api/test_update_router.py` 迁移三个重启用例：systemd 后台重启、服务未安装时报 `INTERNAL_ERROR`、desktop 分支调度 `_restart_desktop_process`。monkeypatch 目标改为 `octop.api.routers.service_control`。另加两个用例：`_local_version()` 在元数据可得时等于 `importlib.metadata.version("octop")`，元数据缺失时（monkeypatch 抛 `PackageNotFoundError`）等于 `octop.__version__`；`_is_desktop_process()` 对 `OCTOP_GREEN_PACKAGES` 与 `OCTOP_DESKTOP` 的判定。
+    - 改动：新增 `tests/integration/test_service_control_api.py`。用例：`GET /api/service/status` 返回三个字段，且 `current_version == importlib.metadata.version("octop")`；未带令牌时返回 401；只持 `service_control` 的非管理员在未设置 `OCTOP_SERVICE_MODE` 时调 `POST /api/service/restart`，得 403 且 `error.code == "FORBIDDEN"`；只持 `tls` 的非管理员也得 403。
+    - 改动：在 `tests/unit/api/test_online_fetch_removed_routes.py` 的 `_ADDED_ROUTES` 中加入 `("/api/service/status", "GET")` 与 `("/api/service/restart", "POST")`。
+    - 验证：`uv run pytest tests/unit/api/test_service_control_router.py tests/integration/test_service_control_api.py tests/unit/api/test_online_fetch_removed_routes.py -q`（此时应失败）
+    - _需求：2.1, 2.2, 2.3, 2.4_
+  - [ ] 3.2 实现
+    - 改动：新增 `src/octop/api/routers/service_control.py`，接口见设计文档"组件与接口"。重启函数体从 `update.py` ≈L383-412 原样复制，权限字面量改为 `"service_control"`；`_is_desktop_process` 直接读 `OCTOP_GREEN_PACKAGES`。
+    - 改动：`src/octop/infra/users/permissions.py` 在 `"update"`（≈L198）之后新增 `"service_control"` 条目（本任务暂不删 `update`）。
+    - 改动：`src/octop/api/app.py` 在路由导入列表中加入 `service_control`，并在 `update` 的 mount 行（≈L261）之后加 `_RouterMount(service_control.router, "/api", ["service"])`；`src/octop/api/openapi_meta.py` 在 `update` 标签（≈L144）之后加 `service` 标签。
+    - 改动：`tests/unit/api/test_acl_gate_coverage.py` 的 `GATED_FILES` 加 `"routers/service_control.py"`。
+    - 验证：`uv run pytest tests/unit/api/test_service_control_router.py tests/integration/test_service_control_api.py tests/unit/api/test_online_fetch_removed_routes.py tests/unit/api/test_acl_gate_coverage.py tests/unit/users -q`
+    - 验证：`make lint && make typecheck`
+    - _需求：2.1, 2.2, 2.3, 2.4, 3.6_
+
+- [ ] 4. 删除自更新后端，并把 update 键迁移为 service_control（1.0 人日）
+  - [ ] 4.1 先写会失败的用例
+    - 改动：新增 `tests/unit/db/test_fork_permission_keys.py`，直接用 SQLite 连接覆盖以下情况：`["update", "tls"]` 变为 `["service_control", "tls"]`；`["service_control", "update"]` 变为 `["service_control"]`；不含 `update` 的行不变；执行两次结果不变；`permissions` 为非法 JSON 时视为空列表、不报错；没有 `users` 表或 `settings` 表时跳过；`settings` 中的 `update.stable_only` 行被删除。
+    - 改动：新增 `tests/integration/test_service_control_permission_migration.py`。
+      - SQLite 用例：用 `env` 夹具拿到服务器；先经 `POST /api/users` 建一个普通用户，再用 SQL 把它的 `permissions` 改写为 `'["update","channels"]'`（绕过 `validate_permission_keys`，模拟存量值），并插入一行 `settings('update.stable_only','false')`；执行 `set_fork_version(pool, v - 1)` 与 `run_fork_migrations(pool)`，其中 `v = next(k for k, f in _FORK_PY_STEPS.items() if f is step_service_control_permission)`，不把号写死；以管理员 `PATCH /api/users/{id}` 修改显示名，期望 200，读回的 `permissions == ["service_control", "channels"]`，`settings_repo.get("update.stable_only") is None`。
+      - PG 用例：同一流程，加 `requires_postgresql`（来自 `tests/support/postgresql.py`），写法参照 `tests/integration/test_postgresql_control_plane.py`。
+    - 改动：在路由守卫的 `_REMOVED_ROUTES` 中加入 `/api/update/status` GET、`/api/update/check` POST、`/api/update/settings` PATCH、`/api/update/upgrade` POST、`/api/update/progress` GET、`/api/update/restart` POST；在 token 守卫中加入 `mirrors.cloud.tencent.com`、`pypi.tuna.tsinghua.edu.cn`、`mirrors.ustc.edu.cn`。
+    - 验证：`uv run pytest tests/unit/db/test_fork_permission_keys.py tests/integration/test_service_control_permission_migration.py tests/unit/api/test_online_fetch_removed_routes.py tests/unit/test_online_fetch_tokens_removed.py -q`（此时应失败）
+    - _需求：1.2, 3.2, 3.3, 3.4, 3.5_
+  - [ ] 4.2 迁移
+    - 改动：新增 `src/octop/infra/db/fork_permission_keys.py`，实现 `rewrite_permission_keys` 与 `step_service_control_permission`（任务 1 若发现 `w1-02` 已有等价函数，则只写后者并复用前者）。
+    - 改动：新增 `src/octop/infra/db/migrations/forkNNN_service_control_permission.sql` 与 `.pg.sql`，只含注释。在 `src/octop/infra/db/fork_migrate.py` 的 `_FORK_PY_STEPS` 登记 `NNN`；`NNN` 在合入 fork 主干前按当时下一个可用号确定。
+    - 验证：`uv run pytest tests/unit/db tests/unit/db/test_fork_permission_keys.py -q`
+    - _需求：3.2, 3.3, 3.5_
+  - [ ] 4.3 删除
+    - 改动：删除 `src/octop/infra/setup/self_update.py`、`src/octop/api/routers/update.py`、`src/octop/api/routers/update_store.py`、`src/octop/cli/commands/update.py`。
+    - 改动：`src/octop/api/app.py` 删掉路由导入中的 `update` 与 `_RouterMount(update.router, ...)`（≈L261）；`src/octop/api/openapi_meta.py` 删掉 `update` 标签（≈L144）；`src/octop/cli/registry.py` 删掉 `"update"`（≈L31）；`src/octop/infra/users/permissions.py` 删掉 `"update"`（≈L198-206）；`tests/unit/api/test_acl_gate_coverage.py` 删掉 `"routers/update.py"`（≈L25）。
+    - 改动：删除测试 `tests/unit/infra/setup/test_self_update.py`、`tests/unit/api/test_update_store.py`、`tests/unit/api/test_update_router.py`（重启用例已在 3.1 迁移）、`tests/unit/cli/test_update_cmd.py`、`tests/integration/test_update_api.py`。
+    - 改动：新增 CLI 用例（放进 `tests/unit/cli/test_update_cmd_removed.py`）：`CliRunner` 调 `octop --help`，输出不含 `update`；调 `octop update`，退出码非零。
+    - 验证：`uv run pytest tests/unit/api tests/unit/cli tests/unit/users tests/unit/db tests/integration/test_service_control_api.py tests/integration/test_service_control_permission_migration.py tests/unit/test_online_fetch_tokens_removed.py -q`
+    - 验证：`test ! -e src/octop/infra/setup/self_update.py && test ! -e src/octop/api/routers/update.py && ! rg -n '"update"' src/octop/infra/users/permissions.py src/octop/cli/registry.py`
+    - 验证：`OCTOP_TEST_DATABASE_URL=<专用库 DSN> uv run pytest tests/integration/test_service_control_permission_migration.py -q`（PG 用例，也可用 `make test-postgresql`）
+    - _需求：1.2, 1.3, 3.1, 3.4, 3.6_
+
+- [ ] 5. 前端自更新链路下线与 serviceApi（1.5 人日）
+  - [ ] 5.1 先写会失败的用例
+    - 改动：新增 `dashboard/src/api/modules/service.test.ts`，断言 `serviceApi.getServiceStatus()` 请求 `/service/status`，`serviceApi.restartService()` 请求 `/service/restart` 且 `method: "POST"`（写法同 `skillPackages.test.ts`）。
+    - 改动：新增 `dashboard/src/hooks/useServiceStatus.test.ts`：两个组件同时使用该 hook 时，`serviceApi.getServiceStatus` 只被调用一次；请求失败时返回 `null`。
+    - 改动：token 守卫加入 `pypi.org`。
+    - 验证：`cd dashboard && npm run test -- src/api/modules/service.test.ts src/hooks/useServiceStatus.test.ts`（此时应失败）
+    - _需求：1.1, 1.5, 2.5_
+  - [ ] 5.2 实现
+    - 改动：新增 `dashboard/src/api/modules/service.ts` 与 `dashboard/src/hooks/useServiceStatus.ts`（模块级缓存 promise）。
+    - 改动：删除 `dashboard/src/api/modules/update.ts`、`hooks/useUpdateStatus.ts`、`hooks/useUpdateStatus.test.ts`、`utils/updateStatusCache.ts`、`utils/updateStatusCache.test.ts`、`components/AppVersionBadge/`（整目录）、`pages/Settings/AdvancedSettings/UpdateConfig.tsx`、`UpdateConfig.module.less`。
+    - 改动：`api/index.ts`（≈L17、≈L40）把 `updateApi` 换成 `serviceApi`；`hooks/useServiceRestart.ts`（≈L4、≈L167）改用 `serviceApi.restartService()`；`pages/Settings/HttpsSettings/index.tsx`（≈L12、≈L80-84）改用 `serviceApi.getServiceStatus()`；`components/PwaUpdatePrompt/index.tsx`（≈L4、≈L29、≈L42）只改导入与这两处调用。
+    - 改动：`layouts/Header.tsx` 删掉 ≈L4 的导入与 ≈L93 的渲染；`layouts/Sidebar.tsx` 删掉 ≈L6 的导入、≈L13 的 `useUpdateStatus` 导入、全部 10 处 `hasUpdate`（含 ≈L193 的红点分支与相关 prop 类型）与 ≈L475 的渲染；`components/CurrentVersionBadge/index.tsx` 改用 `useServiceStatus()`，删掉可点击分支与 `userCan(user, "update")`，只渲染带 `header.currentVersion` 提示的 `<span>`。
+    - 改动：`components/AvatarDropdown.tsx` 删掉"检查更新"菜单项（≈L391-402），`RefreshCw` 若已无其他用处则一并删掉导入（≈L25）；外链不动。
+    - 改动：`pages/Settings/AdvancedSettings/index.tsx` 删掉 `RefreshCw`、`UpdateConfig` 的导入与 `updates` 在类型、`TABS`、`parseTab`、`switch` 中的 4 处；`routes/index.tsx` 删掉 ≈L240-241 与 ≈L273-274 的两条重定向；`utils/permissions.ts` 的 `advancedPage`（≈L28）去掉 `"update"`，删掉 `updates: "update"`（≈L64）与 `|| pathname.startsWith("/admin/updates")`（≈L154）。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test`
+    - 验证：`! rg -n "/update/|useUpdateStatus|AppVersionBadge|updateApi|userCan\(user, \"update\"\)" dashboard/src -g '*.ts' -g '*.tsx'`
+    - 验证：`uv run pytest tests/unit/test_online_fetch_tokens_removed.py -q`
+    - 验证（手工）：`uv run octop run` 后以管理员登录，打开浏览器 DevTools 的 Network 面板，刷新首页并停留 1 分钟，确认没有 `/api/update/` 请求；页头与侧栏显示 `v<版本>`，点击不跳转；头像菜单没有"检查更新"；访问 `/admin/advanced?tab=updates` 落到"环境变量"标签；在 HTTPS 标签页点"重启服务"时，请求为 `POST /api/service/restart`。
+    - _需求：1.1, 1.4, 1.5, 2.5_
+
+- [ ] 6. SkillHub 技能市场与 curl | bash 安装器下线（后端，1.5 人日）
+  - [ ] 6.1 先写会失败的用例
+    - 改动：路由守卫加入 `/api/agents/{agent_id}/skills/hub/search` GET、`/api/agents/{agent_id}/skills/hub/rankings` GET、`/api/agents/{agent_id}/skills/hub/install` POST、`/api/skill-packages/hub/search` GET、`/api/skill-packages/hub/rankings` GET、`/api/skill-packages/from-skillhub` POST、`/api/skill-packages/{package_id}/skills/hub/install` POST；token 守卫加入 `skillhub-1388575217` 与 `_install_skillhub_cli`。
+    - 改动：新增 `tests/integration/test_skills_skillhub_leftovers.py`：在 Agent 工作区的 `skills/demo/SKILL.md` 写入带 `metadata.octop.source: skillhub` 与 `icon_url` 的 frontmatter，断言 `GET /api/agents/{id}/skills` 能列出，`/enable`、`/disable` 返回 204，`DELETE` 返回 204。该用例在删除前就应通过，用作回归基线。
+    - 验证：`uv run pytest tests/unit/api/test_online_fetch_removed_routes.py tests/unit/test_online_fetch_tokens_removed.py -q`（此时守卫应失败）；`uv run pytest tests/integration/test_skills_skillhub_leftovers.py -q`（此时应通过）
+    - _需求：4.1, 4.2, 4.4_
+  - [ ] 6.2 删除
+    - 改动：`src/octop/api/routers/skills.py` 删掉 `_SKILLHUB_INSTALL_URL`（≈L75-76）、`_valid_skillhub_icon_url`（≈L173-176）、≈L227-417 的 SkillHub CLI 辅助函数、`LocalizedSkillCopy`、`HubInstallBody`、`_download_skillhub_package_via_cli`、`_parse_skillhub_search_output` 与 ≈L1213 起的三个 hub 端点。`ImportSkillBody` 与 `_AgentWorkspaceInstallTarget` 留给任务 7。孤立的导入以 `make lint` 的 F401 为准删除。
+    - 改动：`src/octop/api/routers/skill_packages.py` 删掉 ≈L14 与 ≈L28 的导入、`_SAFE_SKILLHUB_REASONS`、`FromSkillHubBody`、`_map_skillhub_error`、`package_hub_search`、`package_hub_rankings`、`create_from_skillhub`、`hub_install_package_skill` 以及 ≈L22 的 `create_package_from_skillhub` 导入；保留 `_icon_url` 与 `valid_skillhub_icon_url`。
+    - 改动：删除 `src/octop/infra/skills/skillhub_market.py` 与 `src/octop/infra/skills/skill_package_from_skillhub.py`。
+    - 改动：`src/octop/infra/skills/install.py` 删掉 `with_skillhub_presentation_metadata`、`prepare_skillhub_package`、`install_skill_from_skillhub` 及其 `__all__` 项，以及随之孤立的 `yaml` 与 `parse_frontmatter` 导入；`src/octop/infra/skills/__init__.py` 删掉 `install_skill_from_skillhub`、`prepare_skillhub_package` 的再导出与 `__all__` 项。
+    - 改动：删除测试 `tests/integration/test_skills_hub.py`、`tests/unit/agents/test_skillhub_market.py`、`tests/unit/agents/test_skillhub_http_market.py`、`tests/unit/skills/test_skill_package_from_skillhub.py`、`tests/unit/test_skillhub_install_metadata.py`、`tests/unit/test_skills_hub_errors.py`；`tests/unit/skills/test_skill_install.py` 删掉 `test_prepare_skillhub_package_adds_presentation_metadata`；`tests/integration/test_skill_packages_api.py` 删掉 `test_create_package_from_skillhub_returns_skills_and_rejects_duplicate_name`；`tests/conftest.py` 的 `_SLOW_TEST_MODULES` 删掉 `tests/unit/agents/test_skillhub_market.py`。
+    - 验证：`uv run pytest tests/unit/api tests/unit/skills tests/unit/agents tests/integration/test_skills_api.py tests/integration/test_skill_packages_api.py tests/integration/test_skills_skillhub_leftovers.py tests/unit/test_online_fetch_tokens_removed.py -q`
+    - 验证：`make lint && make typecheck`
+    - 验证：`test ! -e src/octop/infra/skills/skillhub_market.py && test ! -e src/octop/infra/skills/skill_package_from_skillhub.py && ! rg -n "create_subprocess_exec" src/octop/api/routers/skills.py`
+    - _需求：4.1, 4.2, 4.4_
+
+- [ ] 7. URL 导入（skills_hub.py）下线（后端，0.75 人日）
+  - [ ] 7.1 先写会失败的用例
+    - 改动：路由守卫加入 `/api/agents/{agent_id}/skills/import` POST 与 `/api/skill-packages/{package_id}/skills/import` POST；token 守卫加入 `api.github.com`。
+    - 改动：新增 `tests/unit/skills/test_skills_package_exports.py`：`import octop.infra.skills as m`，对 `m.__all__` 中的每个名字断言 `hasattr(m, name)`，并断言 `resolve_url_import`、`install_skill_from_url` 不在其中。
+    - 验证：`uv run pytest tests/unit/api/test_online_fetch_removed_routes.py tests/unit/skills/test_skills_package_exports.py tests/unit/test_online_fetch_tokens_removed.py -q`（此时应失败）
+    - _需求：5.1, 5.2, 5.4_
+  - [ ] 7.2 删除
+    - 改动：删除 `src/octop/infra/skills/skills_hub.py`。
+    - 改动：`src/octop/api/routers/skills.py` 删掉 `ImportSkillBody`（≈L710）、`_AgentWorkspaceInstallTarget`（≈L861）与 `import_skill_from_url`（≈L894-981）；`src/octop/api/routers/skill_packages.py` 删掉 `import_package_skill`（≈L579 起）。
+    - 改动：`src/octop/infra/skills/install.py` 删掉 `skills_hub` 导入（≈L10）、`resolve_url_import`、`install_skill_from_url`；`src/octop/infra/skills/__init__.py` 删掉对应的再导出，docstring 改为 "Skills domain: package validation, global packages, local install."。
+    - 改动：删除 `tests/unit/agents/test_skills_hub_raw.py`，并从 `tests/conftest.py` 的 `_SLOW_TEST_MODULES` 中删掉它；`tests/integration/test_skills_api.py` 删掉 `test_import_skill_from_url`、`test_import_rejects_unsupported_url`、`test_import_rejects_adapter_upload_outside_skill_root`；`tests/integration/test_skill_packages_api.py` 删掉 `test_import_skill_url_into_package`。
+    - 验证：`uv run pytest tests/unit/skills tests/unit/agents tests/integration/test_skills_api.py tests/integration/test_skill_packages_api.py tests/unit/api/test_online_fetch_removed_routes.py tests/unit/test_online_fetch_tokens_removed.py -q`
+    - 验证：`make lint && make typecheck && test ! -e src/octop/infra/skills/skills_hub.py`
+    - _需求：5.1, 5.2, 5.4_
+
+- [ ] 8. 专家市场下线（后端，1.0 人日）
+  - [ ] 8.1 先写会失败的用例
+    - 改动：路由守卫加入 `/api/experts/hub` GET、`/api/experts/hub/{slug}` GET、`/api/experts/hub/{slug}/install` POST。
+    - 改动：新增 `tests/integration/test_experts_market_cache_compat.py`：在 `OCTOP_HOME/expert_market/skillhub-skillset-demo/` 下放一个最小专家模板（manifest 格式参照 `tests/unit/agents/test_expert_catalog.py` ≈L90-109，路径用 `srv.paths.expert_market_dir` 拼接），调用 `srv.expert_catalog.refresh()` 后，断言 `GET /api/experts/skillhub-skillset-demo` 返回 200，且 `GET /api/experts` 不含该 id。
+    - 验证：`uv run pytest tests/unit/api/test_online_fetch_removed_routes.py tests/integration/test_experts_market_cache_compat.py -q`（此时路由守卫应失败，兼容用例应已通过，作为回归基线）
+    - _需求：6.1, 6.3_
+  - [ ] 8.2 删除
+    - 改动：删除 `src/octop/infra/agents/experts/skillhub_market.py` 与 `src/octop/infra/agents/experts/market_creation.py`。
+    - 改动：`src/octop/api/routers/experts.py` 删掉 docstring 中 ≈L7-9 的三行、≈L36-41 与 ≈L59 的导入、`_SAFE_MARKET_REASONS`、`ExpertHubItemResponse`、`ExpertHubListResponse`、`MarketCreateSourceResponse`、`MarketCreateResponse`、`_map_skillhub_error` 与 ≈L556-672 的三个端点。`catalog.py`、`server.py` 的 `extra_roots`、`paths.expert_market_dir`、`manifest_generator.py` 都不动。
+    - 改动：`tests/integration/test_experts_api.py` 删掉 `test_hub_install_mounts_skill_packages` 与 `test_hub_install_rejects_unknown_package_before_creation`。
+    - 验证：`uv run pytest tests/unit/agents tests/integration/test_experts_api.py tests/integration/test_experts_market_cache_compat.py tests/unit/api/test_online_fetch_removed_routes.py -q`
+    - 验证：`make lint && make typecheck && ! rg -n "skillhub_market|market_creation" src/octop`
+    - _需求：6.1, 6.3_
+
+- [ ] 9. 内置 skill-manager 去掉 SkillHub 来源（0.5 人日）
+  - [ ] 9.1 先写会失败的用例
+    - 改动：token 守卫加入 `skillhub.cn`。
+    - 改动：在 `tests/unit/agents/test_octop_builtin_skills.py` 中，把 `test_manager_installs_namespaced_skillhub_page_url`（≈L200）替换为 `test_manager_rejects_skillhub_sources`：在 `PATH` 前置一个假 `skillhub`，它被调用时写一个标记文件；分别用 `skillhub:demo` 与 `https://skillhub.cn/skills/ns/demo` 调用 `inspect`，断言退出码为 1、输出含 `"error"`、标记文件不存在；再断言 `--help` 输出不含 `skillhub-search`。假可执行文件的写法沿用原用例的跨平台分支（Windows 用 `.cmd` 包装）。
+    - 验证：`uv run pytest tests/unit/agents/test_octop_builtin_skills.py tests/unit/test_online_fetch_tokens_removed.py -q`（此时应失败）
+    - _需求：4.3_
+  - [ ] 9.2 实现
+    - 改动：`src/octop/infra/agents/builtin_skills/skill-manager/scripts/manage_skills.py` 删掉 `_skillhub_source`、`_materialize` 中的 SkillHub 分支、`_skillhub_search` 与 `skillhub-search` 子命令，`_effective_name` 改为直接返回 `name`；随之孤立的 `_NAMESPACE_RE`、`unquote` 等以 ruff 为准删除。
+    - 改动：`SKILL.md` 删掉 description 中的 SkillHub 措辞，以及 ≈L32、≈L40-41、≈L54 的 SkillHub 用法说明。
+    - 验证：`uv run pytest tests/unit/agents/test_octop_builtin_skills.py tests/unit/test_online_fetch_tokens_removed.py -q && make lint`
+    - _需求：4.2, 4.3_
+
+- [ ] 10. 前端：技能市场、URL 导入与专家市场下线（2.25 人日）
+  - [ ] 10.1 先改测试
+    - 改动：删除 `dashboard/src/pages/SkillPackages/SkillsetFromHubDrawer.test.tsx`。
+    - 改动：`dashboard/src/pages/Agent/Skills/components/SkillImportModal.test.tsx` 去掉"切换到 ZIP 模式"的步骤与 `onImportUrl` 属性；新增一例断言弹窗中没有 URL 输入框（按 `placeholder` 或 `role="textbox"` 查询为空）。
+    - 改动：`dashboard/src/api/modules/skillPackages.test.ts` 删掉 `fromSkillHub` 的调用与断言（≈L70、≈L94）。
+    - 改动：token 守卫加入 `clawhub.ai`、`https://skills.sh`、`skillsmp.com`。
+    - 验证：`cd dashboard && npm run test -- src/pages/Agent/Skills/components/SkillImportModal.test.tsx src/api/modules/skillPackages.test.ts`（此时 URL 输入框断言应失败）
+    - _需求：4.5, 5.2, 5.3_
+  - [ ] 10.2 Agent 技能页与导入弹窗
+    - 改动：`SkillsTabs.tsx` 删掉 ≈L21 的 `SkillHubTab` 导入、类型里的 `"skillhub"`、≈L32 的标签与 ≈L81-82 的渲染分支，`Store` 图标若不再使用则删掉导入。
+    - 改动：`SkillImportModal.tsx` 删掉 `DEFAULT_SKILL_URL_PREFIXES`、`onImportUrl`、`urlPrefixes`、`mode` 状态与 `Segmented`，直接渲染 ZIP 面板；`InstalledSkillsTab.tsx` 与 `useSkills.ts` 删掉 `importFromUrl`。
+    - 验证：`cd dashboard && npm run test -- src/pages/Agent/Skills`（`SkillPackages/index.tsx` 此时仍向弹窗传 `onImportUrl`，`tsc -b` 放到 10.3 一起验证）
+    - _需求：4.5, 5.3_
+  - [ ] 10.3 技能包页与市场组件删除
+    - 改动：`pages/SkillPackages/index.tsx` 删掉 ≈L70 与 ≈L82 的导入、`SKILL_URL_PREFIXES`（≈L93-96）、`confirmImport` 与 `onImportUrl`（≈L480、≈L1026）、"从 SkillHub 创建"入口（≈L628、≈L673-676）、市场按钮（≈L909）、`SkillsetFromHubDrawer` 渲染（≈L1031）与市场弹窗（≈L1067-1074）及相关状态。
+    - 改动：删除 `pages/Agent/Skills/components/SkillHubTab.tsx`、`SkillHubDetailDrawer.tsx`、`skillHubCache.ts`、`skillInstallTarget.ts`，以及 `pages/SkillPackages/SkillsetFromHubDrawer.tsx` 与 `SkillsetFromHubDrawer.module.less`。删除前执行 `rg -n "SkillHubTab|skillInstallTarget|skillHubCache|SkillHubDetailDrawer|SkillsetFromHubDrawer" dashboard/src`，确认只剩这些文件之间的互相引用。
+    - 改动：`api/modules/skillPackages.ts` 删掉 `fromSkillHub`、`importSkill`、`hubSearch`、`hubRankings`、`hubInstall`；`api/types/skill.ts` 删掉 `HubSkillSpec` 与 `SkillHubSkill`（先 `rg` 确认无剩余引用）。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test -- src/pages/Agent/Skills src/api/modules/skillPackages.test.ts src/pages/SkillPackages`
+    - _需求：4.5, 5.3, 6.2_
+  - [ ] 10.4 专家页
+    - 改动：删除 `pages/Experts/components/ExpertMarketTab.tsx` 与 `api/modules/expertMarket.ts`。
+    - 改动：`pages/Experts/index.tsx` 删掉 ≈L53 的导入、`TabKey` 中的 `"market"`（≈L58）、`marketContent`（≈L513-521）与标签注册（≈L550-554），并更新 ≈L6-12 的注释；`pages/Experts/components/CreateFromExpertDrawer.tsx` 删掉 `expertMarketApi` 与 `MarketExpert` 的导入，以及 `kind: "market"` 的类型分支和它在 ≈L208、≈L237、≈L366-383、≈L429 的处理。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test`
+    - 验证：`test ! -e dashboard/src/api/modules/expertMarket.ts && ! rg -n "SkillHubTab|expertMarket|SkillsetFromHubDrawer|onImportUrl" dashboard/src -g '*.ts' -g '*.tsx'`
+    - 验证：`uv run pytest tests/unit/test_online_fetch_tokens_removed.py -q`
+    - 验证（手工）：Agent 技能页只有"自定义 / 内置 / 技能包"三个标签；"导入技能"弹窗只有 ZIP 拖放区；技能包页没有 SkillHub 入口；专家页只有两个标签，从专家库创建 Agent 正常。
+    - _需求：4.5, 5.2, 5.3, 6.2_
+
+- [ ] 11. 插件 URL 安装、上传与市场下线（1.0 人日）
+  - [ ] 11.1 先写会失败的用例
+    - 改动：路由守卫加入 `/api/plugins/install` POST 与 `/api/plugins/upload` POST；token 守卫加入 `raw.githubusercontent.com`。
+    - 改动：新增 `tests/unit/cli/test_plugin_cmd.py`，设置 `monkeypatch.setenv("OCTOP_HOME", str(tmp_path))`。用例：`octop plugin install <tests/fixtures/plugins/echo-tool>` 成功；把该目录打成 ZIP（写法同 `test_plugin_upload.py::_echo_zip`）后 `octop plugin install <x.zip> --force` 成功；`octop plugin install https://example.com/p.zip` 退出码非零，且被 monkeypatch 的 `urllib.request.urlretrieve` 没有被调用。
+    - 验证：`uv run pytest tests/unit/cli/test_plugin_cmd.py tests/unit/api/test_online_fetch_removed_routes.py tests/unit/test_online_fetch_tokens_removed.py -q`（此时应失败）
+    - _需求：7.1, 7.2, 7.3_
+  - [ ] 11.2 后端与 CLI
+    - 改动：`src/octop/api/routers/plugins.py` 删掉 `PluginInstallBody`、`install_plugin`、`upload_plugin` 与孤立的 `tempfile`、`File`、`Form`、`UploadFile` 导入。
+    - 改动：`src/octop/infra/agents/plugins/manager.py` 删掉 `_GITHUB_BLOB_RE`、`normalize_plugin_download_url`、`_assert_http_url`、`install_url` 与 `urllib` 导入。
+    - 改动：`src/octop/cli/commands/plugin.py` 的 `install` 改为：目录 → `install_path`；`path.is_file()` 且后缀为 `.zip` → `install_archive`；其他 → `click.ClickException`。docstring 改为 "Install from a local directory or .zip file."。
+    - 改动：`tests/unit/test_plugin_manager.py` 删掉 `normalize_plugin_download_url` 与两个 `install_url` 用例；`tests/integration/test_plugin_upload.py` 只保留 `test_list_plugins_is_available_to_authenticated_users`，并更新模块 docstring；`tests/integration/test_plugin_tool_disable.py` 改用 `srv.plugin_manager.install_path(_FIXTURE, force=True)` 加 `load_installed(install_deps=False)` 与 `app_runtime.agent_registry.reload_all()` 装插件。
+    - 改动：后端 overlay `src/octop/i18n/intranet/{en,zh}.json` 覆盖 `errors.PLUGIN_INVALID_ARCHIVE`；dashboard overlay 覆盖 `apiErrors.PLUGIN_INVALID_ARCHIVE`（去掉 GitHub 下载建议）。
+    - 验证：`uv run pytest tests/unit/test_plugin_manager.py tests/unit/cli/test_plugin_cmd.py tests/integration/test_plugin_upload.py tests/integration/test_plugin_tool_disable.py tests/unit/api tests/unit/i18n tests/unit/test_online_fetch_tokens_removed.py -q && make lint && make typecheck`
+    - _需求：7.1, 7.2, 7.3_
+  - [ ] 11.3 前端
+    - 改动：删除 `dashboard/src/pages/Admin/Plugins/PluginMarketPanel.tsx`；`pages/Admin/Plugins/index.tsx` 删掉 ≈L9 的导入、`"market"`（≈L11、≈L14）、≈L58-60 的标签与 `Store` 图标，`parseTab` 恒返回 `"installed"`；`InstalledPluginsPanel.tsx` 删掉 URL 安装弹窗（≈L596-609）、`handleInstall`（≈L104）、上传按钮（≈L362）与上传处理（≈L129-137）及相关状态，在页首加一条 `Alert`，文案为 overlay 的 `intranet.plugins.offlineInstallHint`；`api/modules/plugins.ts` 删掉 `install`（≈L77）与 `upload`（≈L86）。
+    - 改动：dashboard overlay 新增 `intranet.plugins.offlineInstallHint`（en / zh）。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test && uv run pytest tests/unit/i18n -q`
+    - 验证（手工）：插件管理页只有"已安装"，没有安装与上传按钮；访问 `?tab=market` 显示"已安装"。
+    - _需求：7.4_
+
+- [ ] 12. Ollama 在线拉模型下线（0.75 人日）
+  - [ ] 12.1 先写会失败的用例
+    - 改动：路由守卫加入 `/api/ollama-models/download` POST、`/api/ollama-models/download-status` GET、`/api/ollama-models/download/{task_id}` DELETE；token 守卫加入 `ollama.pull(` 与 `ollama.com/download`；`tests/unit/cli/test_models_cmd.py` 改为断言 `ollama-list`、`ollama-rm` 在帮助中而 `ollama-pull` 不在。
+    - 验证：`uv run pytest tests/unit/cli/test_models_cmd.py tests/unit/api/test_online_fetch_removed_routes.py tests/unit/test_online_fetch_tokens_removed.py -q`（此时应失败）
+    - _需求：8.1, 8.2_
+  - [ ] 12.2 实现
+    - 改动：删除 `src/octop/api/routers/ollama_download_store.py`；`src/octop/api/routers/ollama_models.py` 删掉 ≈L18 的导入、`download_ollama_model`（≈L117）、`_run_pull_in_background`（≈L149）、`get_ollama_download_status`（≈L179）、`cancel_ollama_download`（≈L192），以及只被它们使用的 `_task_to_response` 与请求 / 响应模型。
+    - 改动：`src/octop/infra/utils/ollama_manager.py` 删掉 `pull_model`（≈L203-214），≈L102 的文案去掉 URL；`src/octop/cli/commands/models.py` 删掉 `ollama-pull`（≈L212-229）。
+    - 改动：`dashboard/src/api/modules/ollamaModel.ts` 删掉三个下载方法；`pages/Settings/Models/components/modals/ProviderConfigModal.tsx` 删掉 `OllamaDownloadTaskResponse`、`ollamaTasks` 状态、`stopOllamaPolling`、`pollOllamaDownloads`、`startOllamaPolling`、`handleOllamaDownload`、取消逻辑与对应 UI，在 Ollama 分支显示 overlay 的 `intranet.models.ollamaPreinstallHint`；`api/types` 中只被它们引用的 `OllamaDownloadRequest`、`OllamaDownloadTaskResponse` 一并删除（先 `rg` 确认）。
+    - 改动：dashboard overlay 新增 `intranet.models.ollamaPreinstallHint`。
+    - 验证：`uv run pytest tests/unit/cli/test_models_cmd.py tests/unit/api tests/unit/test_online_fetch_tokens_removed.py tests/unit/i18n -q && make lint && make typecheck`
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test && ! rg -n "ollama-models/download" dashboard/src -g '*.ts' -g '*.tsx'`
+    - _需求：8.1, 8.2, 8.3_
+
+- [ ] 13. ONNX 在线下载入口下线（1.75 人日）
+  - [ ] 13.1 先写会失败的用例
+    - 改动：路由守卫加入 `/api/onnx-models/download` POST、`/api/onnx-models/download-status` GET、`/api/knowledge-bases/onnx-download` POST、`/api/knowledge-bases/onnx-download-status` GET；token 守卫加入 `huggingface.co`、`hf-mirror.com`、`octop-1258344699`。
+    - 改动：`tests/integration/test_onnx_models_api.py` 新增两例：请求体只有 `{"enabled": true, "model": MODEL}`（不带 `download_if_missing`）时返回 409，且 `GET /api/onnx-models/status` 的 `enabled` 为假；带 `"download_if_missing": true` 时同样返回 409。另加一例：`GET /api/onnx-models/status` 返回的 `download.status == "idle"`（`onnx-activate` 共用同一个 `status_payload`，不再单测）。
+    - 改动：`tests/unit/agents/test_onnx_service.py` 新增 `test_build_text_embedding_is_local_only`：用 `monkeypatch.setitem(sys.modules, "fastembed", SimpleNamespace(TextEmbedding=_Capture))` 捕获关键字参数，断言 `local_files_only is True`。
+    - 验证：`uv run pytest tests/integration/test_onnx_models_api.py tests/unit/agents/test_onnx_service.py tests/unit/api/test_online_fetch_removed_routes.py tests/unit/test_online_fetch_tokens_removed.py -q`（此时应失败）
+    - _需求：9.1, 9.2, 9.3, 9.4, 9.5_
+  - [ ] 13.2 后端
+    - 改动：删除 `src/octop/infra/agents/providers/onnx_download.py` 与 `tests/unit/agents/test_onnx_download.py`。
+    - 改动：`src/octop/infra/agents/providers/onnx_service.py` 删掉 ≈L29 的导入、`OnnxDownloadManager.start_download`、`_download_sync`、`_set` 与 `_task`，以及只被它们使用的 `_ui_progress_from_bytes`（≈L336），保留 `state` 与 `DOWNLOAD_MANAGER`；`_build_text_embedding`（≈L389-392）加 `local_files_only=True`。
+    - 改动：`src/octop/api/routers/onnx_models.py` 删掉 `download_if_missing`、`OnnxDownloadRequest`、`post_download`、`get_download_status`；`put_config` 在 `config.enabled` 且模型未预置时，一律以基线的 409 文案拒绝，并删掉 `download_started` 字段。
+    - 改动：`src/octop/api/routers/knowledge_bases.py` 删掉 `start_onnx_download` 与 `onnx_download_status`（≈L468-484）；`OnnxDownloadBody` 仍被 `onnx-activate` 使用则保留。
+    - 改动：`tests/unit/agents/test_onnx_service.py` 删掉 `test_ui_progress_from_bytes_is_byte_fraction` 与 `test_download_sync_reports_tqdm_bytes`；`tests/unit/api/test_knowledge_bases.py` 删掉 `test_onnx_download_starts_catalog_model`。
+    - 验证：`uv run pytest tests/unit/agents tests/unit/api tests/integration/test_onnx_models_api.py tests/integration/test_knowledge_bases_api.py tests/unit/test_online_fetch_tokens_removed.py -q && make lint && make typecheck`
+    - 验证（手工，Linux）：在一台基线版本已下载过 `BAAI/bge-small-zh-v1.5` 的机器上，断网执行 `unshare -rn uv run python -c "from octop.infra.agents.providers.onnx_service import embed_texts; print(len(embed_texts('BAAI/bge-small-zh-v1.5', ['hi'])[0]))"`，应输出向量维度而非网络错误。若主机不允许非特权用户命名空间，可用 `docker run --network=none` 的等价方式执行。
+    - _需求：9.1, 9.2, 9.3, 9.4, 9.5_
+  - [ ] 13.3 前端
+    - 改动：删除 `dashboard/src/api/modules/onnxDownloadWatcher.ts`；`api/modules/onnxModel.ts` 删掉 `download` 与 `getDownloadStatus`，`putConfig` 的参数类型删掉 `download_if_missing`；`api/modules/knowledgeBases.ts` 删掉 `downloadOnnx` 与 `getOnnxDownloadStatus`，`knowledgeBases.test.ts` 删掉对应断言。
+    - 改动：`pages/Settings/Models/components/modals/ProviderConfigModal.tsx` 删掉 `watchOnnxDownload` 的导入与 `runOnnxDownloadWithProgress`、`handleLocalModelDownload`、`handleOnnxDownloadTerminal`、`dismissDownloadProgressToBackground` 及下载按钮，未预置时显示 `intranet.models.onnxNotProvisioned`；`pages/KnowledgeBases/index.tsx` 删掉 `onnxDownloading`、`onnxDownloadTimer`、`watchOnnxDownloadStatus`、挂载时的下载状态查询、`startOnnxDownload` 与"下载模型"按钮，未预置的模型显示同一提示。
+    - 改动：dashboard overlay 新增 `intranet.models.onnxNotProvisioned`。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test && ! rg -n "onnx-download|onnx-models/download|onnxDownloadWatcher" dashboard/src -g '*.ts' -g '*.tsx'`
+    - 验证：`uv run pytest tests/unit/i18n -q`
+    - _需求：9.6_
+
+- [ ] 14. Let's Encrypt 签发与公网 IP 探测下线（1.25 人日）
+  - [ ] 14.1 先写会失败的用例
+    - 改动：路由守卫加入 `/api/admin/tls/preflight` POST、`/api/admin/tls/issue` POST、`/.well-known/acme-challenge/{token}` GET，并在 `_COMPANION_REMOVED_PATHS` 加入 `/.well-known/acme-challenge/{token}`；token 守卫加入 `api.ipify.org`、`letsencrypt.org`、`from acme`、`josepy`、`install_auto_renewal_job`、`octop_tls_auto_renew`。
+    - 改动：新增 `tests/unit/infra/setup/tls/test_tls_config_compat.py`：`config.json` 的 `tls` 段含 `"acme_staging": true` 时 `load_config` 成功；对 `mode="letsencrypt"`、`enabled=true` 且证书文件存在的配置，`resolve_tls_paths` 与 `build_listen_plan` 的结果与基线一致（`http_port=80`、`port=443` 时双端口）；`http_port=0` 时为单端口且带 TLS。
+    - 验证：`uv run pytest tests/unit/infra/setup/tls tests/unit/api/test_online_fetch_removed_routes.py tests/unit/test_online_fetch_tokens_removed.py -q`（此时守卫应失败）
+    - _需求：10.1, 10.2, 10.3, 10.4, 10.5_
+  - [ ] 14.2 删除与依赖
+    - 改动：删除 `src/octop/infra/setup/tls/acme_issue.py`、`challenge.py`、`preflight.py`、`renewal.py`、`modes.py`，以及测试 `tests/unit/infra/setup/tls/test_challenge.py`、`test_preflight.py`、`test_renewal.py`、`test_modes.py`。
+    - 改动：`src/octop/api/app.py` 删掉 ≈L135-142 与 `PlainTextResponse` 导入；`src/octop/infra/setup/tls/http_companion.py` 删掉挑战路由；`src/octop/infra/setup/tls/__init__.py` 删掉 `challenge_store`；`src/octop/infra/server.py` 删掉 ≈L445-447；`src/octop/launch.py` 的 ≈L128 改为 "(redirect)"；`src/octop/config.py` 删掉 `acme_staging`（≈L87、≈L180）并更新 `TlsConfig` 的 docstring；`src/octop/infra/setup/tls/store.py` 删掉 `install_letsencrypt_cert` 与 `account_key_path`；`tests/unit/infra/setup/tls/test_tls_store.py` 暂时只保留 `resolve_tls_paths` 相关用例。
+    - 改动：`src/octop/infra/setup/tls/manager.py` 先临时收缩为只含 `status_payload` 与 `get_tls_manager`（三态中暂时只有 `idle` / `active`，上传在任务 15 补齐）；`src/octop/api/routers/tls.py` 删掉 `preflight` 与 `issue` 及其模型，`status` 改用 `TlsStatusResponse`（字段见设计文档）；`src/octop/api/openapi_meta.py` 更新 `tls` 标签描述。
+    - 改动：`pyproject.toml` 删掉 `acme>=5.6.0` 与 `josepy>=2.2.0`（≈L33-34），然后执行 `make relock`（按 `w0-04` 的约定传入 `PYPI_INDEX` / `NPM_REGISTRY`，锁文件单独成一个提交）。
+    - 验证：`uv run pytest tests/unit/infra/setup tests/unit/api tests/unit/test_launch_bwrap.py tests/unit/test_online_fetch_tokens_removed.py -q && make lint && make typecheck`
+    - 验证：`! rg -n '^name = "(acme|josepy|pyopenssl|pyrfc3339)"$' uv.lock && ! rg -n 'acme|josepy' pyproject.toml && uv lock --check`
+    - _需求：10.1, 10.2, 10.3, 10.4, 10.5_
+
+- [ ] 15. 上传行内证书（后端，1.5 人日）
+  - [ ] 15.1 先写会失败的用例
+    - 改动：新增 `tests/unit/infra/setup/tls/test_upload.py`。用 `cryptography` 在测试中现场生成：RSA-2048 自签证书（SAN 含 `octop.bank.intra` 与 `10.0.0.8`）、EC P-256 自签证书、只有 CN 的证书、已过期证书、`not_before` 在未来的证书、用口令加密的私钥、与证书不匹配的私钥。覆盖 7 个 `reason` 与 `domains` / `fingerprint_sha256` / 时间字段。
+    - 改动：`tests/unit/infra/setup/tls/test_tls_store.py` 新增 `install_uploaded_cert` 用例：两个文件的内容；`config.json` 的 `tls` 段为设计文档所列的值；原有的 `bind_host`、`port` 与其他顶层键不变；私钥权限为 0600 的断言标 `posix_only`（`pytest.mark.skipif(os.name != "posix", reason=…)`）。
+    - 改动：新增 `tests/unit/infra/setup/tls/test_tls_manager.py`：未启用 TLS 时为 `idle`；运行期配置 `tls.enabled` 且证书与私钥文件存在时为 `active`（不要求端口为 443）；本进程内 `install_upload` 成功后为 `restart_required`；`dual_listeners` 与 `build_listen_plan(...).dual_listeners` 在 `http_port` 为 0、80 两种配置下一致。
+    - 改动：新增 `tests/integration/test_tls_certificate_api.py`：
+      - 管理员上传有效证书，得 200、`state == "restart_required"`；随后 `GET /api/admin/tls/status` 仍为 `restart_required`；`OCTOP_HOME/ssl/` 下两个文件存在；
+      - `audit_log` 中有且只有一条 `tls.certificate.upload`，其 `payload` 等于指纹，并且在整张 `audit_log` 的文本里搜索私钥 PEM 的正文片段搜不到；
+      - 7 类非法输入逐一得 400，`error.code == "TLS_CERT_INVALID"`，`error.details.reason` 符合预期，且 `ssl/` 目录与 `config.json` 的字节均未改变；
+      - 只持 `channels` 的用户调上传与状态接口均得 403；
+      - 路由守卫的 `_ADDED_ROUTES` 加入 `("/api/admin/tls/certificate", "POST")`。
+    - 验证：`uv run pytest tests/unit/infra/setup/tls tests/integration/test_tls_certificate_api.py tests/unit/api/test_online_fetch_removed_routes.py -q`（此时应失败）
+    - _需求：11.1, 11.2, 11.3, 11.4, 11.5_
+  - [ ] 15.2 实现
+    - 改动：新增 `src/octop/infra/setup/tls/upload.py`（`CertificateRejected`、`UploadedCertInfo`、`inspect_certificate_pair`）；`src/octop/infra/setup/tls/store.py` 新增 `install_uploaded_cert`；`src/octop/infra/setup/tls/manager.py` 补齐 `TlsState` 三态与 `install_upload`（文件 I/O 放进 `asyncio.to_thread`）。
+    - 改动：`src/octop/api/routers/tls.py` 新增 `TlsCertificateUpload` 与 `upload_certificate`：成功时写审计，`CertificateRejected` 映射为 `OctopError.localized(ErrorCode.TLS_CERT_INVALID, locale, details={"reason": exc.reason})`，locale 取自 `resolve_request_locale(request)`。
+    - 改动：`src/octop/infra/errors.py` 在 `ErrorCode` 末尾追加 `TLS_CERT_INVALID = "TLS_CERT_INVALID"`，在 `_DEFAULT_STATUS` 末尾追加 `ErrorCode.TLS_CERT_INVALID: 400`；后端 overlay 的 `errors` 与 dashboard overlay 的 `apiErrors` 各加 en / zh 文案（dashboard 文案不带占位符）。
+    - 验证：`uv run pytest tests/unit/infra/setup/tls tests/integration/test_tls_certificate_api.py tests/unit/api tests/unit/i18n -q && make lint && make typecheck`
+    - 验证（手工）：`uv run octop run` 后以管理员在 `/api/docs`（设置 `OCTOP_ENABLE_API_DOCS=1`）确认 `POST /api/admin/tls/certificate` 显示请求与响应模型；用行内测试 CA 签发的证书调用该接口，重启 `octop run`，再执行 `curl --cacert <测试 CA> https://<host>:<port>/api/health` 得 200，且 `ss -ltn` 中没有 80 端口监听。
+    - _需求：11.1, 11.2, 11.3, 11.4, 11.5, 11.7_
+
+- [ ] 16. HTTPS 设置页改为上传表单（前端，1.25 人日）
+  - [ ] 16.1 先写会失败的用例
+    - 改动：新增 `dashboard/src/api/modules/tls.test.ts`：`tlsApi.getStatus()` 请求 `/admin/tls/status`；`tlsApi.uploadCertificate({ cert_pem, key_pem })` 请求 `/admin/tls/certificate`，`method: "POST"`，`body` 为对应 JSON；并断言 `tlsApi` 上不再有 `preflight` 与 `issue`（`expect("preflight" in tlsApi).toBe(false)`）。
+    - 验证：`cd dashboard && npm run test -- src/api/modules/tls.test.ts`（此时应失败）
+    - _需求：11.6_
+  - [ ] 16.2 实现
+    - 改动：`dashboard/src/api/modules/tls.ts` 删掉 `PreflightCheck`、`PreflightResult`、`preflight`、`issue`，`TlsStatus` 对齐新响应（`tls` 与 `state`），新增 `uploadCertificate`。
+    - 改动：重写 `dashboard/src/pages/Settings/HttpsSettings/index.tsx`：
+      - 状态卡：模式（`uploaded` / `letsencrypt`，后者附"请上传行内证书替换"提示）、域名、到期时间，时间用 `formatServerIsoDateTime` 与 `useServerTimezone()`；
+      - 上传区：两个文件选择框（`FileReader.readAsText`）加两个可粘贴的 `TextArea`，提交时调 `uploadCertificate`；
+      - 失败时用 `parseApiError(err)?.details?.reason`（`dashboard/src/utils/apiError.ts`）显示 `intranet.tls.reason.<reason>`，取不到时才回退到 `apiErrorMessage`（后者会把 `reason` 机器码原样拼在文案后）；
+      - `restart_required` 时显示 `tls.restartRequired` 与 `intranet.tls.httpsHint`；`serviceApi.getServiceStatus().service_mode` 非空时显示重启按钮（`requestRestart`），否则显示 `octop service restart` 命令。
+    - 改动：dashboard overlay 覆盖 `tls.title`、`tls.subtitle`、`tls.restartRequired`、`tls.activeCert`，新增 `intranet.tls.*`（键名见设计文档），en 与 zh 同键。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test && uv run pytest tests/unit/i18n -q`
+    - 验证：`! rg -n "preflight|tlsApi\.issue|stagingHint" dashboard/src/pages/Settings/HttpsSettings dashboard/src/api/modules/tls.ts`
+    - 验证（手工）：以中文与英文界面分别打开"应用设置 → HTTPS"：标题不再含 Let's Encrypt；上传不匹配的私钥时提示"私钥与证书不匹配"；上传有效证书后出现重启提示与"改用 https://"说明。
+    - _需求：11.6_
+
+- [ ] 17. 收尾：全量门禁与记录（0.75 人日）
+  - 改动：`CHANGELOG-intranet.md` 的 `[Unreleased]`：
+    - "移除"：自更新（API、CLI `octop update`、控制台升级页与角标）、SkillHub 与专家市场、URL 导入、插件 URL 安装 / 上传 / 市场页、Ollama 拉取、ONNX 下载、Let's Encrypt 签发 / 续期 / 预检，依赖 `acme` 与 `josepy`，以及失效的环境变量清单；
+    - "新增"：`/api/service/status`、`/api/service/restart`、`/api/admin/tls/certificate`、CLI 安装本地 `.zip` 插件；
+    - "变更"：权限键 `update` → `service_control` 及其 fork 迁移，HTTPS 页改为上传，ONNX 启用时缺模型返回 409；
+    - "安全"：删除 `curl | bash` 安装器与控制台插件上传；
+    - 另写一行：存量 Let's Encrypt 实例不再自动续期。
+  - 改动：`docs/api-intranet.md`：第 2 节"已物理删除的上游路由"列出本 spec 删除的全部路由；第 3 节"fork 新增或变更的端点"列三个新端点与 `GET /api/admin/tls/status` 的新响应形状、`PUT /api/onnx-models/config` 的语义变化；第 4 节"鉴权与权限差异"写 `update` → `service_control`；第 5 节"fork 新增错误码"写 `TLS_CERT_INVALID` / 400 / overlay。
+  - 改动：核对需求 12.3，即上游 i18n JSON 零改动。
+  - 验证：`git diff --quiet "$W103_BASE" -- src/octop/i18n/en.json src/octop/i18n/zh.json dashboard/src/locales/en.json dashboard/src/locales/zh.json`
+  - 验证：`make all`
+  - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test`（或 `make check-frontend`）
+  - 验证：`OCTOP_TEST_DATABASE_URL=<专用库 DSN> make test-postgresql`
+  - 验证：`uv run pytest tests/unit/test_online_fetch_tokens_removed.py tests/unit/api/test_online_fetch_removed_routes.py tests/unit/api/test_acl_gate_coverage.py tests/unit/i18n -q`
+  - 验证：`rg -n "w1-03-online-fetch-trim" CHANGELOG-intranet.md docs/api-intranet.md`
+  - _需求：12.1, 12.2, 12.3, 12.4_
