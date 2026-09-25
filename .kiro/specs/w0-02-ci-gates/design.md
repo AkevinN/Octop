@@ -120,14 +120,16 @@ S15 曾建议"给 Linux job 加 postgres service"，本方案不采纳。实测�
 | `.github/workflows/ci.yml` | 修改 | 在 `test-windows`（≈L66）与 `live-tests`（≈L68）之间插入 `frontend` 与 `postgresql` 两个 job |
 | `tests/unit/test_ci_gates_contract.py` | 新增 | CI 与 Makefile 的合同测试 |
 | `tests/unit/test_pg_strict_plugin.py` | 新增 | 插件的钩子级单测 |
-| `dashboard/src/components/DocumentPreviewCore.docxSanitize.test.ts` | 修改 | vitest 导入里加 `vi`，并加 `vi.mock("react-pdf", …)` |
+| `dashboard/src/components/DocumentPreviewCore.docxSanitize.test.ts` | 修改 | vitest 导入里加 `vi`，并加一行 `vi.mock("react-pdf", () => ({ pdfjs: { GlobalWorkerOptions: {} } }))`（这些套件不渲染 PDF，导入期只触碰 `pdfjs.GlobalWorkerOptions`） |
 | `dashboard/src/pages/Agent/Skills/skillMarkdown.test.ts` | 修改 | 同上 |
 | `dashboard/src/pages/Agent/Skills/components/SkillDrawer.test.ts` | 修改 | 同上 |
 | `dashboard/src/api/modules/publishedExperts.test.ts` | 修改 | 第 3 次调用的期望（≈L41-47）补上 `body: JSON.stringify({...})` |
 | `dashboard/src/pages/Agent/Channels/components/constants.test.ts` | 修改 | 删除 ≈L5 未使用的导入 |
-| `CHANGELOG-intranet.md` | 追加（若不存在则新建） | 本 spec 的条目。文件由 `w0-04` 统一格式 |
+| `CHANGELOG-intranet.md` | 不在本提交 | 文件由 `w0-04` 创建并补录本 spec 的条目 |
 
 ### `Makefile.intranet`（新增）
+
+实现与下面的草稿等价，只是省掉了 `NPM_REGISTRY ?=`（未定义的变量本来就展开为空），并把五个 `.PHONY` 合成一行。
 
 ```make
 # Intranet fork targets. Included from the root Makefile (one `include` line)
@@ -296,21 +298,19 @@ _REPO = Path(__file__).resolve().parents[2]
 def _ci_jobs() -> dict[str, Any]: ...            # yaml.safe_load(.github/workflows/ci.yml)["jobs"]
 def _step_runs(job: dict[str, Any]) -> list[str]: ...
 
-def test_ci_has_frontend_job_calling_make_targets() -> None: ...
-def test_ci_has_postgresql_job_with_service_and_step_scoped_dsn() -> None: ...
-def test_dsn_only_in_postgresql_job() -> None: ...          # json.dumps(job) 不含 OCTOP_TEST_DATABASE_URL
-def test_backend_jobs_still_run_make_test() -> None: ...    # quality 与 test-windows 仍执行 make test
-def test_makefile_intranet_defines_gate_targets() -> None: ...  # 按行首 "^<target>:" 查找
-def test_root_makefile_includes_intranet() -> None: ...
+@pytest.mark.parametrize(("job", "targets"), [("frontend", [...]), ("postgresql", [...])])
+def test_ci_fork_job_runs_make_targets(job, targets) -> None: ...  # 调用对应 make 目标，带 sync-develop-after- 条件
+def test_ci_postgresql_service_and_dsn_scoped_to_its_step() -> None: ...  # postgres service；DSN 只在 test-postgresql 那一步，不在 job 级、不在其他 job
+def test_makefile_intranet_defines_gate_targets() -> None: ...  # include 行 + 按行首 "^<target>:" 查找五个目标
 ```
 
 - 只读文本文件，用 `encoding="utf-8"` 和 `pathlib` 拼路径，与平台无关。
 - `yaml` 由当前依赖树提供（venv 里是 6.0.3），它不是 `pyproject.toml` 的直接依赖。如果 `w2-01` 收窄依赖后 `yaml` 不再可用，就改成与 `tests/unit/test_docker_compose_database_env.py` 相同的纯文本解析。
-- 断言故意写得宽松：只检查 fork job 存在、调用了对应目标、DSN 的作用域正确，以及后端 job 仍执行 `make test`，不锁死上游 job 的全部步骤，以免上游正常修改 job 时误报。
+- 断言故意写得宽松：只检查 fork job 存在、调用了对应目标、DSN 的作用域正确，不锁死上游 job 的全部步骤，以免上游正常修改 job 时误报。
 
 ### `tests/unit/test_pg_strict_plugin.py`（新增）
 
-用 `types.SimpleNamespace` 伪造 `report`（字段 `skipped`、`keywords`、`nodeid`）和 `session`（字段 `exitstatus`），直接调用三个钩子。覆盖以下四种情形：
+用 `types.SimpleNamespace` 伪造 `report`（字段 `skipped`、`keywords`、`nodeid`）和 `session`（字段 `exitstatus`），直接调用 `pytest_runtest_logreport` 与 `pytest_sessionfinish`（一个参数化用例，终端摘要由"门禁的负向验证"实跑覆盖）。覆盖以下四种情形：
 
 1. `postgresql` 用例被跳过：退出码由 0 变为 1。
 2. 非 `postgresql` 用例被跳过：退出码不变。

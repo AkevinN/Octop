@@ -1,0 +1,33 @@
+# Intranet fork targets. Included from the root Makefile (one `include` line)
+# so upstream Makefile merges stay trivial. See .kiro/specs/w0-02-ci-gates/.
+#
+# PG tests DROP SCHEMA public: point OCTOP_TEST_DATABASE_URL at a dedicated
+# database and never export it while running `make test` (-n auto runs the PG
+# tests in parallel and they collide).
+
+.PHONY: help-intranet install-frontend test-frontend check-frontend test-postgresql
+
+help-intranet:
+	@echo "Intranet fork targets (Makefile.intranet):"
+	@echo "  install-frontend   npm ci in dashboard/ (NPM_REGISTRY=<url> overrides the .npmrc registry)"
+	@echo "  test-frontend      vitest run"
+	@echo "  check-frontend     typecheck-frontend + lint-frontend + test-frontend"
+	@echo "  test-postgresql    pytest -m postgresql -n 0; a skipped postgresql test fails the run"
+	@echo "                     needs OCTOP_TEST_DATABASE_URL=<dedicated DB> (tests DROP SCHEMA public);"
+	@echo "                     do not export it for make test (parallel PG tests collide)"
+
+install-frontend:
+	cd $(DASHBOARD_DIR) && npm ci --no-audit --no-fund $(if $(strip $(NPM_REGISTRY)),--registry=$(strip $(NPM_REGISTRY)))
+
+test-frontend:
+	@echo "[test-frontend] vitest..."
+	cd $(DASHBOARD_DIR) && npm run test
+
+check-frontend: typecheck-frontend lint-frontend test-frontend
+
+test-postgresql:
+	@if [ -z "$$OCTOP_TEST_DATABASE_URL" ]; then \
+		echo "[test-postgresql] OCTOP_TEST_DATABASE_URL is not set (use a dedicated database: tests DROP SCHEMA public)"; \
+		exit 2; \
+	fi
+	$(PYTHON) -m pytest -p tests.support.pg_strict -m postgresql -n 0 -rs
