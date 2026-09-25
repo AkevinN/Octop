@@ -14,22 +14,29 @@ async def bootstrap_boundary_env(
     client: httpx.AsyncClient,
     srv: OctopServer,
     admin_auth: dict[str, str],
+    *,
+    user_admin_auth: dict[str, str] | None = None,
 ) -> tuple[
     dict[str, str],
     dict[str, str],
     dict[str, Any],
 ]:
-    """Admin + alice + bob + shared provider + alice's agent."""
+    """Admin + alice + bob + shared provider + alice's agent.
+
+    User accounts are created / looked up with ``user_admin_auth`` (defaults to
+    ``admin_auth``); the provider and agent always use ``admin_auth``.
+    """
+    users_auth = user_admin_auth or admin_auth
     shared = await create_provider(
         client,
         admin_auth,
         name="shared-openai",
         api_key="k",
     )
-    alice_auth = await create_user(client, admin_auth, username="alice")
-    bob_auth = await create_user(client, admin_auth, username="bob")
-    alice_id = await resolve_user_id(client, admin_auth, "alice")
-    bob_id = await resolve_user_id(client, admin_auth, "bob")
+    alice_auth = await create_user(client, users_auth, username="alice")
+    bob_auth = await create_user(client, users_auth, username="bob")
+    alice_id = await resolve_user_id(client, users_auth, "alice")
+    bob_id = await resolve_user_id(client, users_auth, "bob")
 
     r = await client.post(
         "/api/agents",

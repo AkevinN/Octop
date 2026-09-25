@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from tests.support.auth_guards import relax_auth_guards, wants_real_guards
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Modules whose tests boot OctopServer, real harness, browser tooling, or bwrap.
@@ -30,6 +32,14 @@ _SLOW_TEST_MODULES = frozenset(
 
 def _module_path(nodeid: str) -> str:
     return nodeid.split("::", 1)[0]
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "real_auth_guards: run the real login captcha / step-up auth checks "
+        "(see tests/support/auth_guards.py)",
+    )
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -67,6 +77,12 @@ def _suspend_proactive_care_loops(
 
     monkeypatch.setattr(ProactiveCareScheduler, "start_all", _start_all)
     monkeypatch.setattr(ProactiveCareScheduler, "_schedule", lambda self, _id: None)
+
+
+@pytest.fixture(autouse=True)
+def _relax_auth_guards(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if not wants_real_guards(request.node):
+        relax_auth_guards(monkeypatch)
 
 
 @pytest.fixture(autouse=True)

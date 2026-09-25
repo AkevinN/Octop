@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,31 @@ from octop.infra.setup.password_file import WIZARD_FILE_NAME, read_password
 
 # Meets ``validate_password_policy`` (letter + digit, length ≥ 8).
 TEST_PASSWORD = "TestPass12"
+
+# Separation-of-duties admin slots. Until w3-03 ships three accounts every slot
+# aliases the single full-key admin; w3-03 then only changes
+# ``TEST_ADMIN_ACCOUNTS`` and the account-creation step of ``bootstrap_admins``.
+ADMIN_SLOTS: tuple[str, ...] = ("system", "security", "audit")
+TEST_ADMIN_ACCOUNTS: dict[str, tuple[str, str]] = dict.fromkeys(
+    ADMIN_SLOTS, ("admin", TEST_PASSWORD)
+)
+
+
+@dataclass(frozen=True)
+class AdminCredentials:
+    """Authorization header per admin slot, plus each slot's username."""
+
+    system: dict[str, str]
+    security: dict[str, str]
+    audit: dict[str, str]
+    usernames: dict[str, str]
+
+
+def all_permission_keys() -> list[str]:
+    """Full permission catalog, read at runtime so adding/removing keys needs no edit here."""
+    from octop.infra.users.permissions import ALL_PERMISSION_KEYS
+
+    return sorted(ALL_PERMISSION_KEYS)
 
 
 def _wizard_password_home(home: Path) -> Path:
@@ -36,7 +62,11 @@ async def bootstrap_admin(
     username: str = "admin",
     password: str = TEST_PASSWORD,
 ) -> httpx.Response:
-    """Run verify-password → initial-admin → finish (creates default ``main`` agent)."""
+    """Run verify-password → initial-admin → finish (creates default ``main`` agent).
+
+    Then grant every permission key explicitly, so the admin keeps its access
+    once the ``is_admin`` bypass is removed (w3-03).
+    """
     pw = read_password(_wizard_password_home(home))
     assert pw is not None, "wizard password file missing"
     tok_resp = await client.post("/api/setup/verify-password", json={"password": pw})
@@ -53,7 +83,26 @@ async def bootstrap_admin(
         headers={"Authorization": f"Bearer {tok}"},
     )
     finish.raise_for_status()
+    grant = await client.patch(
+        f"/api/users/{r.json()['id']}",
+        json={"permissions": all_permission_keys()},
+        headers=bearer(r.json()["access_token"]),
+    )
+    grant.raise_for_status()
     return r
+
+
+async def bootstrap_admins(client: httpx.AsyncClient, home: Path) -> AdminCredentials:
+    """Bootstrap the admin slots (all aliasing one account until w3-03)."""
+    username, password = TEST_ADMIN_ACCOUNTS["system"]
+    await bootstrap_admin(client, home, username=username, password=password)
+    auth = await auth_header(client, username=username, password=password)
+    return AdminCredentials(
+        system=auth,
+        security=auth,
+        audit=auth,
+        usernames={slot: account[0] for slot, account in TEST_ADMIN_ACCOUNTS.items()},
+    )
 
 
 async def login(

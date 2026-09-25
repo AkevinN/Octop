@@ -283,7 +283,7 @@ xdist：monkeypatch 与模块级 `_active` 都按进程、按用例生效，并�
 
 - **`w3-03`（授权地基与三员分立）：**
   1. **删绕过时：** 如果 `setup.py` 的回填正确，`bootstrap_admin` 的授予步骤会幂等成功。如果回填缺失，授予步骤会因 `require_permission("users")` 返回 403 而在夹具建立时统一失败，报错集中在一处，而不是约 51 个文件各自报 403。
-  2. **三员互斥或"角色派生键不落 `users.permissions`"时：** `w3-03` 在 `tests/support/auth.py` 一处调整。具体是把授予步骤改为断言或删除，把 `TEST_ADMIN_ACCOUNTS` 改成三个账号，把建号改调新契约，并把自测 `test_slots_alias_single_admin_before_w303` 改为断言三个账号互不相同。conftest 里 4 处建账调用的槽位也由 `w3-03` 最终确定。
+  2. **三员互斥或"角色派生键不落 `users.permissions`"时：** `w3-03` 在 `tests/support/auth.py` 一处调整。具体是把授予步骤改为断言或删除，把 `TEST_ADMIN_ACCOUNTS` 改成三个账号，把建号改调新契约，并把自测 `test_env_admins_reserve_three_slots` 末尾的别名断言改为断言三个账号互不相同。conftest 里 4 处建账调用的槽位也由 `w3-03` 最终确定。
   3. **仍需 `w3-03` 自己迁移的内容：**
      - 5 个 setup 契约测试文件里的 19 处裸 `/api/setup/initial-admin` 调用（清单见"现状"）；
      - 前端 `dashboard/src/pages/Setup/wizardClient.ts` ≈L156 与 `dashboard/src/api/modules/auth.ts` ≈L162 两个调用点；

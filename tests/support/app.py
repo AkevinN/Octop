@@ -14,6 +14,7 @@ from octop.api.app import build_app
 from octop.config import DatabaseConfig, load_config
 from octop.infra.db.rebind import persist_database_config
 from octop.infra.server import OctopServer
+from tests.support.auth_guards import apply_test_dependency_overrides
 from tests.support.harness import patch_harness
 
 
@@ -61,6 +62,7 @@ async def octop_client(
             await srv.app_runtime.proactive_scheduler.shutdown()
             srv.app_runtime.proactive_scheduler.suspend()
         app = build_app(srv)
+        apply_test_dependency_overrides(app)
         try:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app),
