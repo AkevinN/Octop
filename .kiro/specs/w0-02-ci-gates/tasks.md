@@ -112,7 +112,7 @@
     - _需求：3.2, 4.2, 7.1, 7.2_
     - 状态：远端 CI 无法在本地执行，待开 PR 后完成；本地以 YAML 合同测试与"改坏 ci.yml / Makefile 即变红"的变异验证代替。
 
-- [ ] 6. 收尾（0.25 人日）
+- [x] 6. 收尾（0.25 人日）
   - 改动：
     - `CHANGELOG-intranet.md`：追加 `w0-02-ci-gates` 条目，写明新增的目标（`install-frontend` / `test-frontend` / `check-frontend` / `test-postgresql` / `help-intranet`）、两个 CI job、"PG 用例串行、跳过即失败、只能用专用库"的约定，以及本地复现命令。该文件由 `w0-04` 统一格式；如果本 spec 先合入，就只新建文件并写入这一条。
     - `docs/api-intranet.md`：本 spec 没有 API 变更，不更新。

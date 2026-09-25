@@ -107,7 +107,8 @@ git log --full-history --no-merges --oneline <from>..<to> -- <path> | wc -l
 # 上游窗口内的热点文件
 git log --full-history --no-merges --format= --name-only <旧 tag>..<新 tag> | sort | uniq -c | sort -rn | head -30
 # 上游窗口命中 fork 改动面的文件数（在 fork 主干上执行）
-comm -12 <(git diff --name-only <旧 tag> <新 tag> | sort) <(git diff --name-only <旧 tag> HEAD | sort) | wc -l
+comm -12 <(git log --full-history --no-merges --format= --name-only <旧 tag>..<新 tag> | sort -u) \
+  <(git log --full-history --no-merges --format= --name-only <旧 tag>..HEAD | sort -u) | wc -l
 ```
 
 ## 10. 失败回退

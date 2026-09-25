@@ -9,13 +9,16 @@ from fastapi import FastAPI
 
 from octop.api import intranet_mounts
 from octop.api.app import build_app
+from octop.config import CapabilitiesConfig, MobileCapabilities, OctopConfig
 
 SEARCH = "octop.api.routers.search:router"
+MOBILE = "octop.api.routers.mobile:router"  # mounted by the separate ``if enable_mobile:`` block
+_CFG = OctopConfig(capabilities=CapabilitiesConfig(mobile=MobileCapabilities(enabled=True)))
 
 
 def _build(monkeypatch: pytest.MonkeyPatch, refs: set[str]) -> FastAPI:
     monkeypatch.setattr(intranet_mounts, "_FORK_DISABLED_MOUNTS", frozenset(refs))
-    return build_app(SimpleNamespace(services=None))
+    return build_app(SimpleNamespace(services=None, config=_CFG))
 
 
 def test_empty_set_returns_mounts_unchanged() -> None:
@@ -25,7 +28,7 @@ def test_empty_set_returns_mounts_unchanged() -> None:
 
 
 # Every registered ref must name a router build_app really mounts; SEARCH is the probe.
-@pytest.mark.parametrize("ref", sorted(intranet_mounts._FORK_DISABLED_MOUNTS | {SEARCH}))
+@pytest.mark.parametrize("ref", sorted(intranet_mounts._FORK_DISABLED_MOUNTS | {SEARCH, MOBILE}))
 def test_disabled_router_is_not_mounted(monkeypatch: pytest.MonkeyPatch, ref: str) -> None:
     mounted = set(_build(monkeypatch, set()).openapi()["paths"])
     remaining = set(_build(monkeypatch, {ref}).openapi()["paths"])

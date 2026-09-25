@@ -7,15 +7,17 @@ import ipaddress
 import socket
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
 import pytest
 
 from octop.infra.utils import ssrf_guard
-from octop.infra.utils.intranet_allowlist import IntranetAllowlist, configure_intranet_allowlist
 from octop.infra.utils.ssrf_guard import UnsafeOutboundUrl
+
+if TYPE_CHECKING:  # keep this module importable on the pre-allowlist baseline
+    from octop.infra.utils.intranet_allowlist import IntranetAllowlist
 
 # Representative allowlists: https-only, and with plain http enabled.
 HTTPS_ALLOW: dict[str, Any] = {"cidrs": ["10.0.0.0/8"], "host_suffixes": ["bank.intra"]}
@@ -74,6 +76,8 @@ DNS: dict[str, list[str]] = {
 @contextmanager
 def use_intranet_allowlist(**kwargs: Any) -> Iterator[IntranetAllowlist]:
     """Install an allowlist for the block, then reset to empty (no cross-test leaks)."""
+    from octop.infra.utils.intranet_allowlist import configure_intranet_allowlist
+
     try:
         yield configure_intranet_allowlist(**kwargs)
     finally:

@@ -88,7 +88,7 @@ cli/ ──► launch.py ──► api/ + infra/
 | `octop.i18n` | Locale JSON + `tr()` + per-namespace helpers | `infra/utils/locale`, stdlib | `api/`, `cli/`, `dashboard/` |
 | `octop.launch` | Wire `OctopServer`, `build_app`, uvicorn for `octop run` | `infra/`, `api/` | business logic; must not be imported by `infra/` |
 | `infra/utils/` | Pure helpers (paths, ulid, env files, Ollama) | stdlib, third-party | any other `infra/*` domain code |
-| `infra/db/repos/` | One repo per table — SQL only | `infra/db/_base`, `infra/utils/` | `agents/`, `gateway/`, `api/`, orchestration |
+| `infra/db/repos/` | One repo per table — SQL only | `infra/db/repos/_base`, `infra/db/pool`, `infra/utils/` | `agents/`, `gateway/`, `api/`, orchestration |
 | `infra/` (domain) | Business logic & orchestration | `infra/utils/`, `infra/db/`, `octop.config`, peer `infra/*` subpackages, `infra/errors`, `infra/metrics` | `api/`, `cli/`, `launch.py`, `dashboard/` |
 | `api/` | HTTP: routing, auth, SSE, OpenAPI | `infra/`, `octop.config`, sibling `api/*` | `cli/`, `launch.py`; no business rules that belong in `infra/` |
 | `cli/` | Terminal UX | `infra/`, `octop.config`, `launch.py`, sibling `cli/*` | `api/`; domain logic duplicated from `infra/` |
