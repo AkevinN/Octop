@@ -15,14 +15,16 @@ from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.server import OctopServer
 from tests.support.app import octop_client
 from tests.support.auth import (
-    auth_header,
+    AdminCredentials,
     bootstrap_admin,
+    bootstrap_admins,
     create_agent,
     create_provider,
     create_user,
     resolve_user_id,
     seed_openai_provider,
 )
+from tests.support.auth_guards import apply_test_dependency_overrides
 from tests.support.fakes import FakeHarnessAgent
 from tests.support.harness import patch_harness
 from tests.support.scenarios import bootstrap_boundary_env
@@ -31,6 +33,8 @@ __all__ = [
     "bootstrap_admin",
     "patch_harness",
 ]
+
+_EnvAdmins = tuple[httpx.AsyncClient, OctopServer, AdminCredentials]
 
 
 @pytest.fixture
@@ -52,14 +56,19 @@ async def patched_app_client(
 
 
 @pytest.fixture
-async def env(
-    tmp_octop_home: Path,
-) -> AsyncIterator[tuple[httpx.AsyncClient, OctopServer, dict[str, str]]]:
-    """Admin-authenticated client (no shared provider pre-seeded)."""
+async def env_admins(tmp_octop_home: Path) -> AsyncIterator[_EnvAdmins]:
+    """Client + server with the system / security / audit admin slots bootstrapped."""
     async with octop_client(tmp_octop_home) as (client, srv):
-        await bootstrap_admin(client, tmp_octop_home)
-        auth = await auth_header(client)
-        yield client, srv, auth
+        yield client, srv, await bootstrap_admins(client, tmp_octop_home)
+
+
+@pytest.fixture
+async def env(
+    env_admins: _EnvAdmins,
+) -> AsyncIterator[tuple[httpx.AsyncClient, OctopServer, dict[str, str]]]:
+    """Admin-authenticated client (no shared provider pre-seeded); the ``system`` slot."""
+    client, srv, admins = env_admins
+    yield client, srv, admins.system
 
 
 @pytest.fixture
@@ -120,12 +129,13 @@ async def env_with_provider_record(
 @pytest.fixture
 async def env_alice_bob_agent(
     env_with_provider: tuple[httpx.AsyncClient, OctopServer, dict[str, str]],
+    env_admins: _EnvAdmins,
 ) -> AsyncIterator[tuple[httpx.AsyncClient, OctopServer, dict[str, str], dict[str, str], str]]:
     """Two regular users plus alice-owned agent (channels / cron isolation)."""
     from tests.support.auth import ensure_users
 
-    client, srv, admin_auth = env_with_provider
-    users = await ensure_users(client, admin_auth, "alice", "bob")
+    client, srv, _admin_auth = env_with_provider
+    users = await ensure_users(client, env_admins[2].security, "alice", "bob")
     r = await client.post(
         "/api/agents",
         headers=users["alice"],
@@ -145,26 +155,29 @@ async def env_alice_bob_agent(
 @pytest.fixture
 async def env_admin_alice(
     env_with_provider: tuple[httpx.AsyncClient, OctopServer, dict[str, str]],
+    env_admins: _EnvAdmins,
 ) -> AsyncIterator[tuple[httpx.AsyncClient, OctopServer, dict[str, str], dict[str, str]]]:
     client, srv, admin_auth = env_with_provider
-    alice_auth = await create_user(client, admin_auth, username="alice")
+    alice_auth = await create_user(client, env_admins[2].security, username="alice")
     yield client, srv, admin_auth, alice_auth
 
 
 @pytest.fixture
 async def env_usage(
     env_admin_alice: tuple[httpx.AsyncClient, OctopServer, dict[str, str], dict[str, str]],
+    env_admins: _EnvAdmins,
 ) -> AsyncIterator[
     tuple[httpx.AsyncClient, OctopServer, dict[str, str], dict[str, str], dict[str, int]]
 ]:
     client, srv, admin_auth, alice_auth = env_admin_alice
-    alice_id = await resolve_user_id(client, admin_auth, "alice")
+    alice_id = await resolve_user_id(client, env_admins[2].security, "alice")
     yield client, srv, admin_auth, alice_auth, {"alice_id": alice_id}
 
 
 @pytest.fixture
 async def env_boundary(
     env: tuple[httpx.AsyncClient, OctopServer, dict[str, str]],
+    env_admins: _EnvAdmins,
 ) -> AsyncIterator[
     tuple[
         httpx.AsyncClient,
@@ -176,7 +189,9 @@ async def env_boundary(
     ]
 ]:
     client, srv, admin_auth = env
-    alice_auth, bob_auth, ctx = await bootstrap_boundary_env(client, srv, admin_auth)
+    alice_auth, bob_auth, ctx = await bootstrap_boundary_env(
+        client, srv, admin_auth, user_admin_auth=env_admins[2].security
+    )
     yield client, srv, admin_auth, alice_auth, bob_auth, ctx
 
 
@@ -228,7 +243,9 @@ async def env_terminal(
     """``(server, app, token, agent_id)`` for terminal route tests."""
     client, srv, auth, agent_id = env_with_main_agent
     tok = auth["Authorization"].split(" ", 1)[1]
-    yield srv, build_app(srv), tok, agent_id
+    app = build_app(srv)
+    apply_test_dependency_overrides(app)
+    yield srv, app, tok, agent_id
 
 
 @pytest.fixture

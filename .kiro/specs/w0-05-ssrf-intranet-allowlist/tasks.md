@@ -1,0 +1,165 @@
+# 实施计划：SSRF 守卫内网白名单
+
+> spec：`w0-05-ssrf-intranet-allowlist` ｜ 波次：Wave 0 ｜ 基线：`757fd12` ｜ 预估：3 人日
+> 前置：无 ｜ 全局约束：`.kiro/steering/intranet-transformation.md`
+
+每个顶层任务完成后可独立提交；提交前运行任务内的验证命令。
+
+- [x] 1. 确认前置 spec 已合入并记录基线（0.25 人日）
+  - 改动：无代码改动。本 spec 没有前置 spec；Wave 0 的 `w0-01` 到 `w0-04` 与本 spec 文件不重叠，是否已合入都不影响开工。确认工作分支包含 `757fd12`，打本地标签 `w0-05-base` 作为后续 diff 检查的基准（标签是本地 ref，不是仓库文件），并把以下命令的输出贴进 PR 描述。（实施记录：未打标签，本 spec 为单提交，下文 `w0-05-base` 一律以该提交的父提交 `HEAD~1` 代替，避免在共享仓库留下 ref。）
+  - 验证：`git merge-base --is-ancestor 757fd12 HEAD && echo baseline-ok`
+  - 验证：`git tag -f w0-05-base HEAD`
+  - 验证：`uv run pytest tests/unit/utils/test_ssrf_guard.py tests/unit/connectors/test_custom_mcp.py tests/unit/connectors/test_mcp_oauth_ssrf.py tests/unit/connectors/test_oauth_discovery.py tests/unit/test_connectors.py tests/unit/test_config.py -q`（基线实测 157 passed；前序 spec 若改过这些文件，以实际数为准并记录）
+  - 验证：`! rg -n "^\s*(from|import) octop\." src/octop/infra/utils | rg -v "octop\.infra\.utils"`（utils 层边界在基线上成立）
+  - 验证：`! rg -n "intranet_allow" src tests`（没有同名键或符号）
+  - _需求：1.2, 6.7_
+
+- [x] 2. 默认行为快照测试（在基线代码上即应通过，作为回归护栏，0.5 人日）
+  - [x] 2.1 测试辅助
+    - 改动：新增 `tests/support/outbound.py`，只依赖标准库、`httpx` 与 `ssrf_guard`：
+      - `fake_dns(monkeypatch)`：替换 `socket.getaddrinfo`，按模块级 `DNS` 表返回 `(AF_INET/AF_INET6, SOCK_STREAM, 6, "", (ip, port))`，并记录收到的 `(host, port)`；IP 字面量原样返回；表外主机抛 `socket.gaierror`。
+      - `record_pinned(monkeypatch, handler)`：把 `octop.infra.utils.ssrf_guard.PinnedIPTransport` 替换为记录 `(target_host, pin_ip)` 并返回 `httpx.MockTransport(handler)` 的工厂，返回调用记录列表（请求计数由调用方的 handler 自记）。
+      - `outcome` / `expected`：把返回值或 `(type(exc), str(exc))` 规整成可精确比较的值；`check_outbound(monkeypatch, url, result)`：同时断言 `validate_https_url_resolved` 与 `safe_request` 的结果、钉 IP 与"拒绝时不建 transport"，供快照与白名单用例共用。
+      - 快照语料 `BASELINE_CASES` 也放在这里（测试目录没有 `__init__.py`，测试模块之间不互相 import）。
+    - 验证：`uv run python -c "import tests.support.outbound"`
+    - _需求：1.1_
+  - [x] 2.2 快照用例
+    - 改动：新增 `tests/unit/utils/test_ssrf_guard_baseline.py`：
+      - `BASELINE_CASES`（定义在 `tests/support/outbound.py`）：逐条写入 design.md "基线行为实测"表的全部行，每行给出 `validate_https_url(url, field="f")` 与 `validate_mcp_http_url(url)` 的预期（返回值，或"异常类型 + 完整 `str(exc)`"），用 `type(exc) is …` 与 `str(exc) == …` 精确比对。
+      - 解析期用例：`fake_getaddrinfo` 表为 `pub.example.com → 93.184.216.34`、`oa.bank.intra → 10.1.2.3`、`evil.example.com → 10.1.2.3`、`mixed.bank.intra → [10.1.2.3, 169.254.169.254]`；断言 `validate_https_url_resolved` 分别为放行、三种 `private or reserved …`，无法解析的主机为 `cannot resolve hostname 'nodns.bank.intra'`。
+      - `safe_request` 用例：`https://pub.example.com/x` 以 `PinnedIPTransport("pub.example.com", "93.184.216.34")` 建连并返回 200；`https://oa.bank.intra/x` 抛 `private or reserved …` 且没有创建 transport；`http://pub.example.com/x` 抛 `only https URLs are allowed`；`getaddrinfo` 收到的端口为 443。
+      - 任务 4 的只放宽不变式直接从 `BASELINE_CASES` 过滤基线放行项，不另设 `BASELINE_PASSING_URLS`。
+    - 验证：`uv run pytest tests/unit/utils/test_ssrf_guard_baseline.py -q`（基线代码上全部通过）
+    - _需求：1.1, 1.2_
+
+- [x] 3. 白名单模型与 setter（测试先行，0.5 人日）
+  - [x] 3.1 先写会失败的测试
+    - 改动：在 `tests/support/outbound.py` 追加 `use_intranet_allowlist(**kw)` 上下文管理器：进入时调 `configure_intranet_allowlist(**kw)`，退出时无参调用以重置为空。
+    - 改动：新增 `tests/unit/utils/test_intranet_allowlist.py`，写入以下用例：
+      - 合法配置：`10.0.0.0/8`、`192.168.10.0/24`、`fd00::/8`、裸 IP `10.9.9.9`（视为 /32）；后缀 `Bank.Intra.`、`.corp.bank.intra` 被归一化为 `bank.intra`、`corp.bank.intra`；重复项去重且保持顺序。
+      - 非法网段逐条抛 `ValueError`，消息以 `intranet_allow_cidrs` 开头并含该条目：`10.1.2.3/8`（主机位非零）、`not-a-cidr`、`0.0.0.0/0`、`127.0.0.0/8`、`169.254.0.0/16`、`224.0.0.0/4`、`240.0.0.0/4`、`::/0`、`fe80::/10`、`::ffff:0:0/96`。
+      - 非法后缀逐条抛 `ValueError`，消息以 `intranet_allow_host_suffixes` 开头：空串、`*.bank.intra`、`bank.intra/x`、`bank.intra:80`、`bank intra`、`10.1.2.3`、`localhost`、`a.localhost`、`intra`、`bank..intra`。
+      - 跨字段：只有后缀、只打开 http 时抛 `ValueError`，消息含 `requires intranet_allow_cidrs`。
+      - 非法配置不替换当前值：先配置合法白名单，再用非法参数调用 `configure_intranet_allowlist`，捕获异常后 `current_intranet_allowlist()` 仍是原值；无参调用后 `is_empty` 为真。
+      - 以下三条经守卫公开接口（`validate_https_url`、`validate_https_url_resolved`、`intranet_http_allowed`）验证，写在任务 4 的用例里，不直接测模型方法。硬拒集只在配置期校验：已配置网段不可能与之相交，运行期无需再判。
+      - `permits_ip`：`10.1.2.3` 为真；`172.16.0.5` 为假；`::ffff:10.1.2.3` 为真（归一化）；`169.254.169.254`、`::ffff:169.254.169.254`、`127.0.0.1`、`::1`、`0.0.0.0`、`224.0.0.1`、`240.0.0.1`、`fe80::1` 在任何配置下都为假。
+      - `trusts_host` 的标签边界：后缀 `bank.intra` 对 `bank.intra`、`a.b.bank.intra` 为真，对 `evilbank.intra`、`bank.intra.evil.com` 为假；IP 字面量为真。
+      - http 放行（`intranet_http_allowed`）：`allow_http=False` 时恒为假；为真时，对网段内字面量与命中后缀的主机名为真，对 `example.com`、`172.16.0.5` 为假。
+    - 验证：`uv run pytest tests/unit/utils/test_intranet_allowlist.py -q`（此时应因模块不存在而失败）
+    - _需求：2.3, 3.4, 5.5_
+  - [x] 3.2 实现
+    - 改动：新增 `src/octop/infra/utils/intranet_allowlist.py`，按 design.md "组件与接口"实现 `IntranetAllowlist`（`is_empty`、`permits_ip`、`trusts_host`）、`configure_intranet_allowlist`（校验 + 原子替换）、`current_intranet_allowlist`；硬拒集为私有常量 `_HARD_DENY`。只 import 标准库。
+    - 验证：`uv run pytest tests/unit/utils/test_intranet_allowlist.py -q`
+    - 验证：`! rg -n "^\s*(from|import) octop\." src/octop/infra/utils/intranet_allowlist.py`
+    - 验证：`make typecheck`
+    - _需求：2.3, 3.4, 5.5, 6.7_
+
+- [x] 4. `ssrf_guard` 四个放行点（测试先行，0.75 人日）
+  - [x] 4.1 先写会失败的测试
+    - 改动：写进 `tests/unit/utils/test_intranet_allowlist.py`（与任务 3 合并为一个文件，不另建 `test_ssrf_guard_intranet.py`）。所有用例都在 `use_intranet_allowlist(...)` 内执行，DNS 用 `fake_dns`，HTTP 用 `record_pinned` / `check_outbound`：
+      - 网段放行：`cidrs=["10.0.0.0/8"]` 下，`validate_https_url("https://10.20.30.40/mcp")` 与 `validate_https_url("https://[::ffff:10.1.2.3]/")` 返回原 URL；`https://172.16.0.5/` 仍抛 `private or reserved …`。
+      - 硬拒集：在 `cidrs=["10.0.0.0/8"]`、`host_suffixes=["bank.intra"]`、`allow_http=True` 下，`https://169.254.169.254/latest/meta-data`、`https://[::ffff:169.254.169.254]/`、`https://127.0.0.1/`、`https://[::1]/`、`https://0.0.0.0/`、`https://224.0.0.1/`、`https://240.0.0.1/`、`https://[fe80::1]/` 抛 `private or reserved …`，`https://localhost/` 抛 `…: localhost is not allowed`。
+      - 两因子与防重绑定：`oa.bank.intra → 10.1.2.3` 时 `validate_https_url_resolved` 放行，`safe_request` 的调用记录为 `("oa.bank.intra", "10.1.2.3")`；`mixed.bank.intra → [10.1.2.3, 169.254.169.254]`、`lo.bank.intra → 127.0.0.1`、`other.bank.intra → 172.16.0.5`、`evil.example.com → 10.1.2.3` 均抛 `private or reserved …`，且没有创建 transport。
+      - 重定向：handler 对白名单主机返回 `302`、`Location: https://169.254.169.254/`，`safe_request` 返回 302，请求计数为 1。
+      - http 开关：`allow_http=False` 时 `http://10.20.30.40:8080/` 抛 `only https URLs are allowed`；`allow_http=True` 时 `validate_https_url("http://10.20.30.40:8080/mcp")` 放行，`safe_request("POST", "http://oa.bank.intra/x")` 钉到 `10.1.2.3`，`getaddrinfo` 收到端口 80；`http://example.com/`、`http://172.16.0.5/` 抛 `only https URLs are allowed`；`pub.bank.intra → 1.2.3.4` 时 `safe_request("GET", "http://pub.bank.intra/")` 抛 `only https URLs are allowed`。
+      - `intranet_http_allowed`：与上面 http 开关的各组输入结论一致。
+      - 只放宽不变式：对 `BASELINE_CASES` 中基线放行的每一条，在上述代表性白名单下 `validate_https_url` 的返回值与基线相同。
+    - 验证：`uv run pytest tests/unit/utils/test_intranet_allowlist.py -q`（此时应失败）
+    - _需求：1.4, 2.1, 2.2, 2.3, 2.4, 3.1, 3.2, 3.3, 3.5, 4.1, 4.2, 4.3, 4.4_
+  - [x] 4.2 实现
+    - 改动：`src/octop/infra/utils/ssrf_guard.py`：
+      - import `IntranetAllowlist`、`current_intranet_allowlist`；
+      - 新增公开函数 `intranet_http_allowed(url)`（不另设 `_http_host_permitted`）；
+      - `_parse_https_host`（≈L22）的条件改为 `parsed.scheme != "https" and not intranet_http_allowed(url)`；
+      - `_check_ip_not_private`（≈L30）加带默认值的参数 `allow`，基线判定为拒绝时先查 `allow.permits_ip`；
+      - `_check_ip_literal`（≈L47）传 `current_intranet_allowlist()`；
+      - `_check_resolved_ip`（≈L50）加 `allow` 参数（明文检查内联在 `_resolve_validated_ip`）；
+      - `_resolve_validated_ip`（≈L94-108）持有一次策略快照，明文端口默认 80，按 `trusts_host` 决定是否传 `allow`，明文时要求每个解析结果 `permits_ip`；
+      - 更新 `validate_https_url`、`safe_request` 的 docstring。
+
+      `validate_https_url`、`validate_https_url_resolved`、`safe_request` 的函数体不改。
+    - 改动（未做）：`test_ssrf_guard_baseline.py` 不加 autouse fixture。所有注入非空白名单的用例都经 `use_intranet_allowlist` 在退出时重置；泄漏只会让快照变红，不会假绿。
+    - 验证：`uv run pytest tests/unit/utils -q`
+    - 验证：`uv run pytest tests/unit/utils/test_ssrf_guard.py tests/unit/connectors/test_mcp_oauth_ssrf.py tests/unit/connectors/test_oauth_discovery.py -q`
+    - 验证：`make typecheck`
+    - _需求：1.1, 1.2, 1.4, 2.1, 2.2, 2.3, 2.4, 3.1, 3.2, 3.3, 3.5, 4.1, 4.2, 4.3, 4.4_
+
+- [x] 5. 自定义 MCP 前置拦截与消费方回归（测试先行，0.25 人日）
+  - [x] 5.1 先写会失败的测试
+    - 改动：新增 `tests/unit/connectors/test_ssrf_intranet_consumers.py`：
+      - `validate_mcp_http_url`：`cidrs=["10.0.0.0/8"]` 下 `https://10.20.30.40/mcp` 放行；`allow_http=False` 时 `http://10.20.30.40:8080/mcp` 抛 `ValueError("non-local url must use https")`；`allow_http=True` 时放行；`http://example.com/mcp` 仍抛 `non-local url must use https`。
+      - 间接消费方：`allow_http=True` 时 `builder.normalize_weknora_base_url("http://10.20.30.40:8080")` 返回 `http://10.20.30.40:8080/api/v1`。
+      - OAuth：`sso.bank.intra → 10.2.3.4`，在 `cidrs=["10.0.0.0/8"]`、`host_suffixes=["bank.intra"]` 下 `await _ensure_mcp_oauth_url("https://sso.bank.intra/token", issuer="https://sso.bank.intra", field="token_endpoint")` 返回原 URL；空白名单下抛 `ValueError`，消息含 `private or reserved`。
+      - 语音：`await voice.adapters._guard_voice_base_url("http://10.1.2.3:8000/v1")` 在 `allow_http=True` 下通过，在 `allow_http=False` 下抛 `only https URLs are allowed`；`_guard_voice_base_url("https://169.254.169.254")` 在两种配置下都抛异常。不为将由 `w1-05` 删除的 `_guard_mimo_base_url` 写用例。
+    - 验证：`uv run pytest tests/unit/connectors/test_ssrf_intranet_consumers.py -q`（`validate_mcp_http_url` 与 weknora 的 http 用例此时应失败，其余用例应已通过）
+    - _需求：2.1, 4.1, 4.2, 4.3, 7.2, 7.3, 7.4_
+  - [x] 5.2 实现
+    - 改动：`src/octop/infra/connectors/custom_mcp.py`：
+      - ≈L9 的 import 加上 `intranet_http_allowed`；
+      - `validate_mcp_http_url` 的 ≈L134 改为 `if parsed.scheme != "https" and not intranet_http_allowed(text):`，消息 `non-local url must use https` 不变；
+      - ≈L130-131 的 loopback 分支不动。
+    - 验证：`uv run pytest tests/unit/connectors tests/unit/test_connectors.py -q`
+    - 验证：`git diff --exit-code w0-05-base -- src/octop/infra/voice/adapters.py src/octop/infra/connectors/oauth/discovery.py src/octop/infra/connectors/oauth/mcp.py src/octop/infra/connectors/probe.py`
+    - _需求：1.2, 4.1, 4.2, 4.3, 7.1, 7.4_
+
+- [x] 6. `config.py` 三触点（测试先行，0.25 人日）
+  - [x] 6.1 先写会失败的测试
+    - 改动：新增 `tests/unit/test_config_intranet_allowlist.py`（不改上游的 `tests/unit/test_config.py`）：
+      - 文件值：写入三个键后，`load_config` 返回的对应字段等于写入值；这一条验证第三触点。
+      - env 覆盖：`monkeypatch.setenv` 设置 `OCTOP_INTRANET_ALLOW_CIDRS="10.0.0.0/8, 192.168.10.0/24"`、`OCTOP_INTRANET_ALLOW_HOST_SUFFIXES="bank.intra"`、`OCTOP_INTRANET_ALLOW_HTTP="true"`，覆盖文件值。
+      - 首次写出：`config.json` 不存在时调用 `load_config`，写出的 JSON 含三个键，值为 `[]`、`[]`、`false`。
+      - 类型错误：`"intranet_allow_cidrs": "10.0.0.0/8"`、`[1]`，以及 `"intranet_allow_http": "yes"` 均抛 `ValueError`，消息含键名，且不含文件中另放的哨兵值（例如 `database.password`）。
+    - 验证：`uv run pytest tests/unit/test_config_intranet_allowlist.py -q`（此时应失败）
+    - _需求：5.1, 5.2, 5.3, 5.4_
+  - [x] 6.2 实现
+    - 改动：`src/octop/config.py`：
+      - **触点一**：`OctopConfig` 末尾（≈L145 之后）追加三个字段；
+      - **触点二**：`load_config` 中 `OCTOP_BROWSER_IDLE_TIMEOUT_MINUTES` 块（≈L499-509）之后追加三段 env 覆盖；
+      - **触点三**：`return OctopConfig(...)`（≈L592）末尾追加三个关键字参数；
+      - 新增私有 helper `_str_list_key`、`_bool_key`（文件值类型校验）；env 列表按 `OCTOP_CORS_ORIGINS` 的写法内联切分；
+      - `_defaults_for_file` 不改。
+    - 验证：`uv run pytest tests/unit/test_config_intranet_allowlist.py tests/unit/test_config.py -q`
+    - 验证：`rg -n "intranet_allow_(cidrs|host_suffixes|http)" src/octop/config.py`（每个键至少出现在字段、env 块、构造调用三处）
+    - _需求：5.1, 5.2, 5.3, 5.4_
+
+- [x] 7. 注入接线（测试先行，0.25 人日）
+  - [x] 7.1 先写会失败的测试
+    - 改动：CLI 离线注入用例并入下面的集成测试文件（不另建 `tests/unit/cli/test_open_cli_services_intranet_allowlist.py`）：
+      - 在 `tmp_octop_home/config.json` 写入与启动用例相同的三个键；
+      - `with use_intranet_allowlist(), open_cli_services(home=tmp_octop_home):` 内断言 `current_intranet_allowlist()` 等于预期的 `IntranetAllowlist(...)`。
+    - 改动：新增 `tests/integration/test_ssrf_intranet_allowlist.py`，每个用例退出时重置白名单：
+      - 注入与日志：用 `tests.support.app.write_octop_config(tmp_octop_home, intranet_allow_cidrs=["10.0.0.0/8"], intranet_allow_host_suffixes=["bank.intra"], intranet_allow_http=True)` 写配置后，经 `octop_client` 启动。断言 getter 等于配置值；`caplog`（`logger="octop.infra.server"`，INFO）含 `intranet outbound allowlist active`；以 `bind_database=False` 启动后先重置白名单，再 `ensure_control_plane_bound`，断言 `bind_control_plane()` 重新注入；按 `tests/integration/conftest.py` 的 `env` 写法完成 `bootstrap_admin` 与 `auth_header` 后，`PUT /api/connectors/custom-mcp` 保存 `{"servers": {"srv": {"transport": "streamable_http", "url": "http://10.20.30.40:8080/mcp"}}}`，返回 200。
+      - 默认配置启动即重置、并拒绝（合并为一个用例）：在 `use_intranet_allowlist(**ALLOW)` 内以默认配置启动 `octop_client`，断言 `current_intranet_allowlist().is_empty`；同一请求返回 400，`error.code == "CONNECTOR_INVALID_CREDENTIALS"`。
+      - fail-fast：设置 `OCTOP_DATABASE_SQLITE_PATH` 让 `should_defer_control_plane_db` 不走延迟路径（比先启停一次更省），再写入 `intranet_allow_cidrs=["0.0.0.0/0"]`，断言 `OctopServer(home=tmp_octop_home).start()` 抛 `ValueError`（匹配 `intranet_allow_cidrs`），`srv.services is None`，且 SQLite 文件没有被创建，说明数据库没有被打开。`start()` 失败时 `_started` 为假，无需 `stop()`。
+    - 验证：`uv run pytest tests/integration/test_ssrf_intranet_allowlist.py -q`（此时应失败）
+    - _需求：6.1, 6.2, 6.3, 6.4, 6.5, 6.6_
+  - [x] 7.2 实现
+    - 改动：`src/octop/infra/server.py`：
+      - 新增模块级私有函数 `_apply_intranet_allowlist(config)`（见 design.md）；
+      - 在 `start()` 的 `self.config = config`（≈L295）与 `bind_control_plane()` 的 `self.config = config`（≈L344）之后各加一行调用；
+      - 不动 `_boot_runtime` 与 `infra/db/rebind.py`。
+    - 改动：`src/octop/cli/support/db.py`：import `configure_intranet_allowlist`，在 `open_cli_services` 的 `load_config`（≈L25）之后调用一次。
+    - 验证：`uv run pytest tests/integration/test_ssrf_intranet_allowlist.py -q`
+    - 验证：`uv run pytest tests/integration/test_connectors_api.py tests/integration/test_setup_database.py -q`（启动与换库路径回归）
+    - 验证：`! rg -n "^\s*(from|import) octop\." src/octop/infra/utils | rg -v "octop\.infra\.utils"`
+    - _需求：6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7_
+
+- [x] 8. 收尾（0.25 人日）
+  - 改动：新增 `docs/intranet/ssrf-intranet-allowlist.md`，内容包括：
+    - 三个配置键与对应环境变量；
+    - 两因子放行语义与硬拒集；
+    - http 开关，以及"OAuth 端点不要走 http"的要求；
+    - design.md 中 15 个调用点的清单；
+    - 典型配置示例（行内网段、行内域名后缀、仅对老系统开 http）；
+    - fail-fast 的错误消息样例；
+    - "能存不能测"的排障说明：保存只校验字面量，探测才解析 DNS；
+    - 已知缺口：`100.64.0.0/10`、streamable_http 探测与运行期 MCP、语音不钉 IP、`issuer_base_domain`。
+  - 改动：若 `w0-04` 已合入，在 `CHANGELOG-intranet.md` 的"安全"类下追加一条"`w0-05-ssrf-intranet-allowlist`：SSRF 守卫支持内网白名单（`intranet_allow_cidrs` / `intranet_allow_host_suffixes` / `intranet_allow_http`，默认空 = 行为不变）"；若尚未合入，把这条写进 PR 描述，由 `w0-04` 建立该文件时补录。本 spec 没有 API 变更，不更新 `docs/api-intranet.md`；不改 `dashboard/`，不需要前端 typecheck、lint 或 vitest。
+  - 改动：清理本 spec 引入但未使用的符号与导入。
+  - 验证：`make all`（实施记录：本环境的 prettier 版本会改写 dashboard，改为分别运行 `ruff check` + `ruff format --check`（src tests）、`mypy src/octop` 与全量 `pytest -m "not live"`）
+  - 验证：`git diff --exit-code w0-05-base -- tests/unit/test_connectors.py tests/unit/connectors/test_custom_mcp.py tests/unit/utils/test_ssrf_guard.py tests/unit/connectors/test_mcp_oauth_ssrf.py`
+  - 验证：`git diff --exit-code w0-05-base -- src/octop/infra/voice/adapters.py src/octop/infra/connectors/oauth/discovery.py src/octop/infra/connectors/oauth/mcp.py src/octop/infra/connectors/probe.py`
+  - 验证：`git diff --name-only w0-05-base -- dashboard src/octop/i18n src/octop/infra/errors.py src/octop/infra/db/migrations src/octop/api`（应无输出）
+  - 验证：`rg -n "intranet_allow_cidrs|intranet_allow_http|_guard_voice_base_url" docs/intranet/ssrf-intranet-allowlist.md`
+  - 验证：人工检查新增用例只使用 `tmp_path` / `tmp_octop_home` / `pathlib`，不断言 chmod 与 POSIX 路径，不触网（Windows CI 会跑同一批用例）。
+  - _需求：1.3, 7.1, 8.1, 8.2, 8.3_

@@ -1,0 +1,211 @@
+# 实施计划：C 端内容与非交付工程裁剪
+
+> spec：`w1-04-content-trim` ｜ 波次：Wave 1 ｜ 基线：`757fd12` ｜ 预估：8.5 人日
+> 前置：`w0-02-ci-gates`、`w0-03-test-auth-baseline`、`w0-04-fork-isolation-points`、`w1-02-capability-trim`、`w1-03-online-fetch-trim` ｜ 全局约束：`.kiro/steering/intranet-transformation.md`
+
+每个顶层任务完成后可独立提交；提交前运行任务内的验证命令。
+
+约定：任务 1 记录的起始提交记为 `W104_BASE`，后续凡是用到它的命令，执行前先 `export W104_BASE=<任务 1 记录的提交>`。所有新增测试遵守 AGENTS.md §7 的跨平台约定（`pathlib`、`tmp_path`、`encoding="utf-8"`，不断言 POSIX 路径）。本 spec 不修改任何 i18n JSON，删除的界面文案键全部保留为孤儿键。
+
+- [ ] 1. 确认前置 spec 已合入并记录基线（0.25 人日）
+  - 改动：无代码改动。在 PR 描述里记录 `git rev-parse HEAD`（即 `W104_BASE`）、`make all` 的结果，以及以下基线数字：专家目录 18 个、头像 35 个、zh / en 子智能体 272 / 217 个、内置插件 11 个、工作流 9 个。
+  - 验证：`test -f tests/integration/test_removed_routes.py && test -f src/octop/api/routers/service_control.py && test -f tests/unit/api/test_service_control_router.py && test -f CHANGELOG-intranet.md && test -f docs/api-intranet.md && test -f Makefile.intranet && test ! -e src/octop/infra/setup/self_update.py && test ! -e src/octop/api/routers/update.py && test ! -e dashboard/src/pages/Agent/ACP && test ! -e src/octop/infra/desktop`
+  - 验证：`test "$(ls tests/unit/desktop | grep -v __pycache__)" = "test_stamp_version.py"`
+  - 验证：`rg -n '_is_desktop_process|OCTOP_GREEN_PACKAGES|desktop' src/octop/api/routers/service_control.py dashboard/src/api/modules/service.ts`（记录 `w1-03` 实际留下的桌面分支符号，供任务 9.3 使用；若无输出，任务 9.3 只做核验）
+  - 验证：`make all`
+  - _需求：12.3_
+
+- [ ] 2. MBTI 人格后端与 CLI 下线（1 人日）
+  - [ ] 2.1 先写会失败的测试
+    - 改动：新增 `tests/unit/test_content_trim_guard.py`，按设计文档"组件与接口"的骨架建立模块，本任务先放入：`REMOVED_MODULES = ("octop.infra.agents.mbti_profiles", "octop.infra.agents.persona", "octop.api.routers.mbti")` 与 `test_removed_modules_are_not_importable`（`importlib.util.find_spec(name) is None`）；`test_agent_models_and_cli_have_no_persona_mbti`（`AgentCreateBody.model_fields`、`AgentPatchBody.model_fields`、`dataclasses.fields(AgentCreateSpec)` 均不含 `persona_mbti`；`CliRunner().invoke(cli, ["agent", "create", "--help"])` 的输出不含 `--persona-mbti`；`CliRunner().invoke(cli, ["agent", "create", "x", "--persona-mbti", "INTJ"]).exit_code != 0`；`hasattr(AgentManager, "apply_persona_mbti")` 为假）；`test_backend_does_not_read_agent_id_header`（遍历 `src/octop` 下的 `*.py`，断言无文件包含 `X-Octop-Agent-Id`）。
+    - 改动：新增 `tests/integration/test_content_trim_api.py`，用 `env` 夹具、沿用 `tests/integration/test_agents_shared.py` 的建 Agent 写法：`test_create_agent_ignores_persona_mbti`（请求体带 `"persona_mbti": "INTJ"`，断言 201、响应无 `persona_mbti` 键、`srv.services.repos.agent_repo.get(aid).persona_mbti is None`、该行 `config_json` 解析后无 `persona` 键）；`test_patch_agent_ignores_persona_mbti`（PATCH 带该字段返回 200，列仍为 `None`）。
+    - 改动：`tests/integration/test_removed_routes.py`（`w1-02` 新增）：`REMOVED_PREFIXES` 追加 `"/api/mbti"`；OpenAPI `tags` 断言追加 `mbti`；追加已登录请求 `GET /api/mbti/types` 与 `GET /api/mbti/current` 返回 404 的断言。
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/integration/test_content_trim_api.py tests/integration/test_removed_routes.py -q`（此时应失败）
+    - _需求：1.1, 1.2, 1.3, 1.4, 1.5_
+  - [ ] 2.2 删除实现并修正连带测试
+    - 改动：删除 `src/octop/api/routers/mbti.py`、`src/octop/infra/agents/mbti_profiles.py`、`src/octop/infra/agents/persona.py`。
+    - 改动：`src/octop/api/app.py` 的 `build_app`：删除路由导入元组中的 `mbti`（≈L167）与 `_RouterMount(mbti.router, "/api", ["mbti"])`（≈L247）；`src/octop/api/openapi_meta.py` 的 `OPENAPI_TAGS`：删除 `mbti` 一项（≈L129）；`src/octop/infra/__init__.py` 模块 docstring（≈L4）删去 "MBTI personas"。
+    - 改动：`src/octop/infra/agents/manager.py`：删除 `AgentCreateSpec.persona_mbti`（≈L285）、`create` 中的 `if spec.persona_mbti: config["persona"] = ...`（≈L534-535）与 `persona_mbti=spec.persona_mbti`（≈L578）、`apply_persona_mbti` 整个方法（≈L1672-1700）。
+    - 改动：`src/octop/api/routers/agents.py`：删除 `AgentCreateBody.persona_mbti`（≈L46）、`AgentPatchBody.persona_mbti`（≈L65）、`_row_dict` 响应中的 `"persona_mbti"`（≈L151）、`create_agent` 中的 `persona_mbti=body.persona_mbti`（≈L283）。
+    - 改动：`src/octop/cli/commands/agent.py` 的 `create`：删除 `--persona-mbti` 选项（≈L22）、形参（≈L28）与 `AgentCreateSpec(persona_mbti=...)`（≈L51）。
+    - 改动：`src/octop/infra/db/repos/agents.py` 与 `001_initial*.sql` 保持不动（`AgentRow.persona_mbti` 作为列映射保留）。
+    - 改动：删除 `tests/unit/agents/test_persona.py`；`tests/integration/test_personas_admin_api.py` 删除 `test_list_mbti_types_returns_16_entries`、`test_get_persona_preview_substitutes_user`、`test_get_persona_default_returns_preview`（≈L36-66），模块 docstring 去掉 MBTI 两行，6 个管理员用例保留；`tests/integration/test_agents_shared.py` 删除 ≈L117-122 的 `POST /api/mbti/apply` 请求块。`tests/integration/test_e2e_golden_path.py` 不改（请求体中的 `persona_mbti` 被忽略，正好覆盖老客户端兼容）。
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/integration/test_content_trim_api.py tests/integration/test_removed_routes.py tests/integration/test_personas_admin_api.py tests/integration/test_agents_shared.py tests/integration/test_e2e_golden_path.py tests/unit/agents/test_agent_manager.py -q`
+    - 验证：`test ! -e src/octop/api/routers/mbti.py && test ! -e src/octop/infra/agents/mbti_profiles.py && test ! -e src/octop/infra/agents/persona.py && test "$(rg -l -i 'mbti' src/octop --glob '*.py')" = "src/octop/infra/db/repos/agents.py"`
+    - 验证：`git diff --quiet "$W104_BASE" -- src/octop/infra/db/repos/agents.py src/octop/infra/db/migrations`
+    - 验证：`make all`
+    - _需求：1.1, 1.2, 1.3, 1.4, 1.5, 1.6_
+
+- [ ] 3. MBTI 前端入口下线（0.75 人日）
+  - [ ] 3.1 先写会失败的测试
+    - 改动：新增 `dashboard/src/routes/contentTrim.test.ts`：常量 `REMOVED_PATHS = ["/mbti", "/personalization/mbti"]`（后续任务追加）；断言 `routeConfigs.map((r) => r.path)` 与 `Object.keys(pathToKey)` 都不含其中任何一项。
+    - 验证：`cd dashboard && npx vitest run src/routes/contentTrim.test.ts`（此时应失败）
+    - _需求：2.3_
+  - [ ] 3.2 删除组件、类型、路由与调用点
+    - 改动：删除 `dashboard/src/pages/Agent/Personalization/components/{MBTITest.tsx,MBTITest.module.less,MBTISelector.tsx,MBTISelector.module.less}`、`dashboard/src/pages/Experts/components/MbtiCatalogDrawer.tsx`、`dashboard/src/components/MbtiPersonaTag.tsx`、`dashboard/src/api/modules/mbti.ts`、`dashboard/src/api/types/mbti.ts`、`dashboard/public/assets/mbti/`。
+    - 改动：`dashboard/src/api/index.ts` 删除 `mbtiApi` 的导入（≈L30）与展开（≈L82-83）；`dashboard/src/api/types/index.ts` 删除 `export * from "./mbti"`（≈L11）；`dashboard/src/api/request.ts` 的 `isAgentScopedPath` 删除 `/mbti/` 分支与其注释（≈L178-179）。
+    - 改动：`dashboard/src/context/AgentContext.tsx` 的 `OctopAgent` 删除 `persona_mbti`（≈L38），`AgentContext.test.ts` 同步删除（≈L15）。
+    - 改动：`dashboard/src/pages/Agent/Personalization/index.tsx`：从 `PersonalizationTab`、`PERSONALIZATION_TABS`、`TAB_ICONS` 删除 `mbti`，删除 `MBTISelector` 与 `Brain` 导入及 `isMounted("mbti")` 面板（≈L168-183）。
+    - 改动：`dashboard/src/pages/Experts/components/AgentMoreActions.tsx` 删除 `onMbti`（接口与解构）、"人格"菜单项与 `Brain` 导入；同一提交里，`AgentExpertsTable.tsx` 删除两个导入、`mbtiCatalogOpen` / `mbtiAgentId`、`openMbtiCatalog`、人格列、`onMbti` 传参与 `MbtiCatalogDrawer`，`AgentCard.tsx` 删除两个导入、`mbtiCatalogOpen`、人格标签、`onMbti` 传参与 `MbtiCatalogDrawer`；`CatalogDrawer.tsx` ≈L18 注释去掉 "MBTI"。
+    - 改动：`dashboard/src/components/AgentProfileDrawer.tsx` 删除导入与"人格"一行（≈L305-316 的标签文字与 `MbtiPersonaTag`）；`dashboard/src/pages/Settings/octop/AdminAgentCard.tsx` 删除导入与 ≈L149；`dashboard/src/pages/Settings/octop/Agents.tsx` 删除人格列（≈L232-237）。
+    - 改动：`dashboard/src/routes/index.tsx` 从 `pathToKey` 删除 `"/personalization/mbti"`、`"/mbti"`，从 `routeConfigs` 删除 `/mbti` 重定向；`dashboard/src/routes/prefetch.ts` 删除两项。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npx vitest run src/routes src/context`
+    - 验证：`! rg -n -i 'mbti' dashboard/src --glob '!**/locales/**' && test ! -e dashboard/public/assets/mbti`
+    - 验证：`git diff --quiet "$W104_BASE" -- dashboard/src/locales`
+    - _需求：2.1, 2.2, 2.3, 2.4_
+
+- [ ] 4. 主动关怀后端下线（0.75 人日）
+  - [ ] 4.1 先写会失败的测试
+    - 改动：`tests/unit/test_content_trim_guard.py` 的 `REMOVED_MODULES` 追加 `"octop.infra.proactive"`、`"octop.api.routers.proactive_care"`、`"octop.infra.db.repos.care_push"`、`"octop.infra.db.repos.proactive_care_config"`。
+    - 改动：`tests/integration/test_content_trim_api.py` 新增 `test_runtime_has_no_proactive_scheduler`：`srv.app_runtime` 没有 `proactive_scheduler` 属性，`srv.app_runtime.agent_registry` 没有 `set_proactive_scheduler`，`srv.services` 与 `srv.services.repos` 都没有 `care_push_repo`、`proactive_care_config_repo`。
+    - 改动：`tests/integration/test_removed_routes.py` 的 `REMOVED_AGENT_SEGMENTS` 追加 `"/proactive-care"`，并断言已登录请求 `GET /api/agents/{id}/proactive-care` 返回 404。
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/integration/test_content_trim_api.py tests/integration/test_removed_routes.py -q`（此时应失败）
+    - _需求：3.1, 3.2, 3.3_
+  - [ ] 4.2 删除实现与装配
+    - 改动：删除 `src/octop/infra/proactive/`、`src/octop/api/routers/proactive_care.py`、`src/octop/infra/db/repos/proactive_care_config.py`、`src/octop/infra/db/repos/care_push.py`、`tests/unit/proactive/`。
+    - 改动：`src/octop/infra/db/services.py`：删除两个导入（≈L12、≈L18）、`RepoBundle` 的两个字段（≈L61-62）与构造（≈L90-91）、`SharedServices` 的两个 property（≈L191-196）。
+    - 改动：`src/octop/infra/server.py`：删除导入（≈L27-28）、`AppRuntime.proactive_scheduler`（≈L216）、`AppRuntime.replace_services` 中的 `replace_persistence` 调用（≈L231-235）、`_boot_runtime` 中关怀服务与调度器的构造、注册、`start_all` 与 `AppRuntime` 实参（≈L456-470、≈L477、≈L484）、`stop` 中的 `shutdown`（≈L528）。
+    - 改动：`src/octop/infra/agents/manager.py`：删除 `TYPE_CHECKING` 块中的调度器导入（≈L83）、`_proactive_scheduler`（≈L348）、`set_proactive_scheduler`（≈L419-421）、`create` 中的 `ensure_scheduled`（≈L629-630）、`delete` 中的 `cancel`（≈L740-741）。
+    - 改动：`src/octop/api/app.py` 的 `build_app`：删除导入元组中的 `proactive_care`（≈L176）与挂载行（≈L253）；`src/octop/api/openapi_meta.py` 的 `API_DESCRIPTION`（≈L50）括注改为 "(cron reminders)"。
+    - 改动：`tests/conftest.py` 删除 ≈L46-69 的注释、`_PROACTIVE_SCHEDULER_TESTS` 与 `_suspend_proactive_care_loops`（`_module_path` 仍被 ≈L37 使用，保留）；`tests/support/app.py::octop_client` 删除 ≈L57-62；`tests/unit/db/test_runtime_replace_services.py` 删除两个导入（≈L15-16）、关怀服务与调度器构造（≈L47-58）及 `AppRuntime(proactive_scheduler=...)` 实参。
+    - 改动：不改 `src/octop/infra/gateway/`、001 迁移与 `tests/unit/db/test_db_pool.py`；不新增 fork 迁移。
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/integration/test_content_trim_api.py tests/integration/test_removed_routes.py tests/unit/db/test_runtime_replace_services.py tests/unit/db/test_db_pool.py tests/unit/gateway/test_gateway_push.py tests/unit/cron -q`
+    - 验证：`git diff --quiet "$W104_BASE" -- src/octop/infra/gateway src/octop/infra/db/migrations tests/unit/db/test_db_pool.py && ! rg -n -i 'proactive care' src/octop/api/openapi_meta.py`
+    - 验证：`timeout 1800 make test`（全量测试在超时前正常结束，不因遗留 sleep 任务挂起）
+    - 验证：`make all`
+    - _需求：3.1, 3.2, 3.3, 3.4, 3.5, 3.6_
+
+- [ ] 5. 主动关怀前端下线（0.25 人日）
+  - 改动：删除 `dashboard/src/pages/Agent/Memory/ProactiveConfig.tsx` 与 `ProactiveConfig.module.less`；`MemoryPanel.tsx` 删除 `ProactiveConfig` 导入（≈L32）、`MemoryTab` 中的 `"proactive"`（≈L46）、标签项（≈L103-108）、`case "proactive"`（≈L263-269）与只在此处使用的 `Bell` 导入。
+  - 改动：`dashboard/src/api/modules/agent.ts` 删除 `ProactiveConfig`、`ProactiveCareConfig` 类型导入（≈L6-7）与 `getProactiveConfig`、`updateProactiveConfig`、`getProactiveCareConfig`、`updateProactiveCareConfig`（≈L81-97）；`dashboard/src/api/types/agent.ts` 删除两个接口（≈L66-98）。
+  - 改动：`dashboard/src/pages/Experts/components/iconForName.tsx`、`src/octop/infra/agents/experts/publish.py` 保持不动（`PROACTIVE.md` 与 `HEARTBEAT.md` 的标签和导出白名单仍在用）。
+  - 验证：`cd dashboard && npx tsc -b && npm run lint && npx vitest run src/pages/Agent/Memory`
+  - 验证：`! rg -n 'ProactiveConfig|ProactiveCareConfig|proactive-care|proactive-config' dashboard/src --glob '!**/locales/**'`
+  - 验证：`git diff --quiet "$W104_BASE" -- dashboard/src/pages/Experts/components/iconForName.tsx src/octop/infra/agents/experts/publish.py dashboard/src/locales`
+  - _需求：4.1, 4.2, 4.3_
+
+- [ ] 6. 内置专家 18 → 11（1 人日）
+  - [ ] 6.1 先写会失败的测试
+    - 改动：`tests/unit/test_content_trim_guard.py` 新增 `EXPECTED_EXPERTS`（需求 5.1 的 11 个 id）与 `test_expert_library_matches_allowlist`（`default_library_root()` 下的目录名集合，不含 `README.md`）；新增 `test_expert_library_has_no_removed_capability_refs`：遍历专家库全部 `*.md`、`*.json`，断言不含 `MBTI`、`browser_use`，且 `office-automation/skills/news` 不存在。
+    - 改动：`tests/integration/test_content_trim_api.py` 新增 `test_removed_expert_returns_404`（`GET /api/experts/news-trend` 为 404、`error.code == "NOT_FOUND"`，`GET /api/experts` 的 id 与 7 个已删 id 不相交）与 `test_create_agent_with_removed_template_is_blank`（`template_name="news-trend"` 返回 201，`caplog` 中有 "not found in catalog" 的 WARNING）。
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/integration/test_content_trim_api.py -q`（此时应失败）
+    - _需求：5.1, 5.3, 5.4, 5.5_
+  - [ ] 6.2 删除 7 个专家与头像，修正硬编码测试
+    - 改动：删除 `src/octop/infra/agents/experts/library/{clinical-learning-subscription,karpathy-knowledge-base,meituan-living-assistant,news-trend,parenting-companion,stock-assistant,wechat-ops}/` 与 `dashboard/public/experts/avatars/` 下的同名 7 个 SVG；`src/octop/infra/agents/experts/catalog.py` 的 `_FALLBACK_BUNDLED_AVATAR_IDS`（≈L41-79）删除这 7 个 id，17 个 `scene-*` 不动。
+    - 改动：删除 `tests/unit/agents/test_clinical_learning_subscription_template.py`、`tests/unit/agents/test_karpathy_knowledge_base_template.py`；`tests/unit/agents/test_expert_catalog.py` ≈L64-66 与 ≈L83 的 `stock-assistant` 换成 `ops-engineer`；`tests/unit/agents/test_library_task_examples.py::test_domain_experts_offer_six_task_examples` 的 `richer` 只留 `"ops-engineer"`；`tests/integration/test_experts_api.py::test_get_expert_file_contents_limited_to_preview_paths` 改用 `/api/experts/ai-coding-coach` 并断言 `"skills/cheatsheet/SKILL.md" in names`；`tests/live/test_agent_expert_template_live.py` 删除 ≈L122-124 三条断言、`test_wechat_ops_copies_skill_scripts`、`test_stock_assistant_skill_references_copied`，≈L241 的 `template_name` 改为 `"general-assistant"`。
+    - 验证：`test "$(find src/octop/infra/agents/experts/library -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 11 && test "$(ls dashboard/public/experts/avatars/*.svg | wc -l)" -eq 28`
+    - 验证：`uv run pytest tests/unit/agents/test_expert_catalog.py tests/unit/agents/test_library_task_examples.py tests/integration/test_experts_api.py tests/integration/test_content_trim_api.py -q && uv run pytest tests/live --collect-only -q`
+    - _需求：5.1, 5.2, 5.3, 5.4, 5.6_
+  - [ ] 6.3 保留专家的内容清理
+    - 改动：删除 `default/IDENTITY.md`（≈L29-37，保留其后的"说明："段）、`cvm-ai-doctor/USER.md`（≈L40-48）、`cvm-cluster-doctor/IDENTITY.md` 与 `USER.md`（≈L38-46）中的"## MBTI 人格"标题及列表。
+    - 改动：删除 `office-automation/skills/news/`；`office-automation/SOUL.md` 删除 `news` 表格行（≈L16），`IDENTITY.md` 删除 `news` 列表项（≈L38），`manifest.json` 的 `description.zh` 删去"和获取办公资讯"、`description.en` 删去 "and office news briefings"。
+    - 验证：`! rg -n 'MBTI|browser_use' src/octop/infra/agents/experts/library && test ! -e src/octop/infra/agents/experts/library/office-automation/skills/news`
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/unit/agents/test_expert_catalog.py tests/unit/agents/test_library_task_examples.py -q`
+    - 验证：`make all`
+    - _需求：5.5_
+
+- [ ] 7. 子智能体分类裁剪（0.5 人日）
+  - [ ] 7.1 先写会失败的测试
+    - 改动：`tests/unit/test_content_trim_guard.py` 新增 `EXPECTED_DIVISIONS`、`REMOVED_DIVISIONS` 与 `test_subagent_divisions_match_allowlist`：对 `default_package_root() / "library" / locale`，分别断言分类目录集合与 `divisions.json` 的 `divisions` 键集合都等于 `EXPECTED_DIVISIONS[locale]`；在 `test_expert_library_has_no_removed_capability_refs` 中追加 `multi-agent-orchestrator/*.md` 不含任何 `REMOVED_DIVISIONS` 与 `marketing-content-creator`。
+    - 改动：`tests/integration/test_content_trim_api.py` 新增 `test_subagent_divisions_trimmed`（`GET /api/subagent-catalog/divisions` 共 14 条，每条 `count > 0`，与 `REMOVED_DIVISIONS` 不相交）与 `test_install_removed_subagent_returns_404`（`POST /api/agents/{id}/subagents/install`，`{"slug": "marketing-content-creator"}`，404 且 `error.code == "NOT_FOUND"`）。
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/integration/test_content_trim_api.py -q`（此时应失败）
+    - _需求：6.1, 6.2, 6.3_
+  - [ ] 7.2 删除分类并同步 JSON 与引用
+    - 改动：删除 `src/octop/infra/agents/subagents/library/{zh,en}/{marketing,game-development,paid-media,spatial-computing,sales}/`；`zh/divisions.json` 与 `en/divisions.json` 的 `divisions` 删除这 5 项（`_note` 不动）。
+    - 改动：`experts/library/multi-agent-orchestrator/AGENTS.md` ≈L13 的分类清单删去 5 个分类，≈L14 与 `SOUL.md` ≈L10 的示例 `marketing-content-creator` 换成 `testing-api-tester`。
+    - 改动：`tests/integration/test_subagents_api.py::test_catalog_divisions`（≈L106）与 `tests/unit/agents/test_subagent_catalog.py::test_bundled_library_non_empty`（≈L195）的 `== 19` 改为 `== 14`。
+    - 验证：`test "$(find src/octop/infra/agents/subagents/library/zh -name '*.md' | wc -l)" -eq 187 && test "$(find src/octop/infra/agents/subagents/library/en -name '*.md' | wc -l)" -eq 154`
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/unit/agents/test_subagent_catalog.py tests/integration/test_subagents_api.py tests/integration/test_content_trim_api.py -q`
+    - _需求：6.1, 6.2, 6.3, 6.4, 5.5_
+
+- [ ] 8. 内置插件 11 → 3（0.5 人日）
+  - [ ] 8.1 先改测试
+    - 改动：`tests/unit/test_bundled_plugins_layout.py` 的 `_EXPECTED`（≈L11-25）改为 `{"pomodoro", "qrcode", "server-status"}`，`test_offline_bundled_plugins_load` 的元组（≈L65）改为 `("pomodoro", "qrcode", "server-status")`；`tests/unit/cli/test_init_cmd.py` ≈L43-46 的 `weather` 换成 `pomodoro`，并追加断言 `sorted(p.name for p in (fake_home / ".octop" / "plugins").iterdir() if p.is_dir()) == ["pomodoro", "qrcode", "server-status"]`。
+    - 改动：`tests/unit/test_content_trim_guard.py` 新增 `REMOVED_REPO_PATHS` 与 `test_removed_repo_paths_absent(repo_root)`，本任务先放入 `plugins/bilibili-anime`、`dashboard/src/pages/Chat/Weather`、`tests/unit/test_hot_topics_plugin.py`。
+    - 验证：`uv run pytest tests/unit/test_bundled_plugins_layout.py tests/unit/cli/test_init_cmd.py tests/unit/test_content_trim_guard.py -q`（此时应失败）
+    - _需求：7.1, 7.2, 7.4_
+  - [ ] 8.2 删除插件与孤儿页面
+    - 改动：删除 `src/octop/infra/agents/plugins/bundled/{bilibili-anime,fortune,hot-topics,market-quotes,mini-games,parcel-tracker,tetris,weather}/`、`plugins/bilibili-anime/`、`tests/unit/test_hot_topics_plugin.py`、`dashboard/src/pages/Chat/Weather/`。`tests/unit/test_plugin_seed.py`、`tests/unit/test_plugins.py`、`tests/unit/backup/test_system_archive.py` 使用合成插件，不改。
+    - 验证：`test "$(find src/octop/infra/agents/plugins/bundled -maxdepth 1 -mindepth 1 -type d -not -name __pycache__ | wc -l)" -eq 3 && ! rg -n 'http' src/octop/infra/agents/plugins/bundled --glob 'main.py'`
+    - 验证：`uv run pytest tests/unit/test_bundled_plugins_layout.py tests/unit/cli/test_init_cmd.py tests/unit/test_content_trim_guard.py tests/unit/test_plugin_seed.py tests/unit/test_plugins.py tests/unit/backup/test_system_archive.py -q`
+    - 验证：`cd dashboard && npx tsc -b`
+    - _需求：7.1, 7.2, 7.3, 7.4_
+
+- [ ] 9. `desktop/`、`fnos/` 与公网安装脚本下线（1.25 人日）
+  - [ ] 9.1 先写会失败的测试
+    - 改动：`tests/unit/test_content_trim_guard.py` 的 `REMOVED_REPO_PATHS` 追加 `desktop`、`fnos`、`scripts/build-fpk.sh`、`scripts/fnos`、`scripts/release_download_links.py`、`scripts/install.sh`、`scripts/install-octop.sh`、`scripts/install.ps1`、`scripts/install.bat`、`tests/unit/test_green_launch.py`、`tests/unit/desktop/test_stamp_version.py`、`tests/unit/test_release_download_links.py`。
+    - 改动：`tests/unit/api/test_service_control_router.py`（`w1-03` 新增）：删除断言 desktop 分支调度 `_restart_desktop_process` 的用例；新增 `test_restart_forbidden_when_desktop_env_set_without_service_mode`（`monkeypatch.setenv("OCTOP_DESKTOP", "1")`、`OCTOP_GREEN_PACKAGES` 指向 `tmp_path`，`detect_service_mode` 返回 `None`，并把 `os.execv` 替换为记录调用的桩；断言 403、`error.code == "FORBIDDEN"`、桩未被调用）与 `test_status_has_no_desktop_field`（响应键集合为 `{"current_version", "service_mode"}`）。
+    - 验证：`uv run pytest tests/unit/test_content_trim_guard.py tests/unit/api/test_service_control_router.py -q`（此时应失败）
+    - _需求：8.1, 8.2_
+  - [ ] 9.2 删除目录、脚本与连带文件
+    - 改动：删除 `desktop/`、`fnos/`、`scripts/build-fpk.sh`、`scripts/fnos/`、`scripts/release_download_links.py`、`scripts/install.sh`、`scripts/install-octop.sh`、`scripts/install.ps1`、`scripts/install.bat`、`tests/unit/test_green_launch.py`、`tests/unit/desktop/test_stamp_version.py`（目录随之消失）、`tests/unit/test_release_download_links.py`。
+    - 改动：`.gitignore` 删除 `!desktop/src/build/` 与 `!desktop/src/build/**`（≈L3-4）；`scripts/README.md` 只保留"构建 PyPI wheel"一节（删除 ≈L5-66 的安装章节与 ≈L88-93 的平台说明）；`src/octop/infra/setup/service.py` 中找不到 `octop` 可执行文件时的 `FileNotFoundError` 文案（≈L189-192）去掉 "run `scripts/install.sh` or"。
+    - 改动：`pyproject.toml`、`uv.lock`、`dashboard/src/utils/desktopChrome.ts` 及其使用方保持不动。
+    - 验证：`test ! -e desktop && test ! -e fnos && test ! -e scripts/fnos && test ! -e scripts/build-fpk.sh && test ! -e scripts/install.sh && test ! -e scripts/install-octop.sh && test ! -e scripts/install.ps1 && test ! -e scripts/install.bat && test -f scripts/wheel_build.sh && test -f scripts/wheel_build.ps1 && test -f scripts/smoke_memory_api.py`
+    - 验证：`! rg -n 'desktop/src/build|scripts/install' .gitignore scripts/README.md src/octop/infra/setup/service.py`
+    - 验证：`uv run pytest --collect-only -q -m "not live" > /dev/null && uv run pytest tests/unit/test_content_trim_guard.py -q`
+    - 验证：`git diff --quiet "$W104_BASE" -- pyproject.toml uv.lock dashboard/src/utils/desktopChrome.ts && cd dashboard && npx vitest run src/utils/desktopChrome.test.ts`
+    - _需求：8.1, 8.3, 8.4, 8.5_
+  - [ ] 9.3 删除 `service_control.py` 的桌面分支
+    - 改动：`src/octop/api/routers/service_control.py`（`w1-03` 新增）：删除 `_GREEN_PACKAGES_ENV`、`_is_desktop_process`、`_restart_desktop_process`、`ServiceStatusResponse.desktop` 及 `service_status` 中的赋值；`restart_service_endpoint` 删除 desktop 分支，`description` 改为 "Requires the service_control permission. Only works under OCTOP_SERVICE_MODE."。符号以任务 1 的 `rg` 记录为准。
+    - 改动：`dashboard/src/api/modules/service.ts`（`w1-03` 新增）若有 `desktop?: boolean` 则删除；用 `rg -n 'desktop' dashboard/src/api/modules/service.ts dashboard/src/hooks dashboard/src/pages/Settings dashboard/src/components/PwaUpdatePrompt` 逐个核对并删除消费点（可选属性，`tsc` 不会报漏改）。
+    - 验证：`uv run pytest tests/unit/api/test_service_control_router.py tests/unit/api/test_acl_gate_coverage.py -q`
+    - 验证：`! rg -n 'OCTOP_DESKTOP|OCTOP_GREEN_PACKAGES|_restart_desktop_process|_is_desktop_process' src/octop dashboard/src`
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npx vitest run src/api src/hooks`
+    - 验证：`make all`
+    - _需求：8.2_
+
+- [ ] 10. 发布、镜像推送、同步类工作流与 `.cursor/` 下线（0.25 人日）
+  - 改动：`tests/unit/test_content_trim_guard.py` 的 `REMOVED_REPO_PATHS` 追加 `.cursor` 与 `.github/workflows/{octop-desktop,fnos-build-fpk,release,auto-tag-on-release,docker-publish,sync-main-to-develop}.yml`（先运行确认失败）。
+  - 改动：删除上述 6 个工作流与 `.cursor/`；`ci.yml`、`codeql.yml`、`anti-spam-issues.yml`、`.github/codeql/`、`.github/ISSUE_TEMPLATE/`、`.github/pull_request_template.md` 不动。
+  - 改动：`AGENTS.md` ≈L375（§9 表格 Branching & release 行）与 ≈L407 删除 `.cursor/skills/publish`；≈L402 把"→ Actions syncs `main` → `develop` (`sync-main-to-develop.yml`; …)"改为"→ merge `main` back into `develop` manually"。`CONTRIBUTING.md` ≈L57 与 ≈L122 删除 `sync-main-to-develop.yml` 自动同步的描述（保留"`main` 必须是 `develop` 的祖先"），≈L77 删除 `.cursor/skills/publish` 一行。不触及 AGENTS.md §7 的 Database 段。
+  - 验证：`test "$(ls .github/workflows | sort | tr '\n' ' ')" = "anti-spam-issues.yml ci.yml codeql.yml " && test ! -e .cursor`
+  - 验证：`! rg -n '\.cursor/skills/publish|sync-main-to-develop\.yml' AGENTS.md CONTRIBUTING.md`
+  - 验证：`git diff --quiet "$W104_BASE" -- .github/workflows/ci.yml .github/workflows/codeql.yml .github/codeql .github/ISSUE_TEMPLATE .github/pull_request_template.md`
+  - 验证：`uv run pytest tests/unit/test_content_trim_guard.py -q`
+  - _需求：9.1, 9.2, 9.3_
+
+- [ ] 11. 前端调试页、项目外链与零引用依赖（0.5 人日）
+  - [ ] 11.1 先写会失败的测试
+    - 改动：`dashboard/src/routes/contentTrim.test.ts` 的 `REMOVED_PATHS` 追加 `"/pwa-debug"`；`tests/unit/test_content_trim_guard.py` 的 `REMOVED_REPO_PATHS` 追加 `dashboard/src/pages/PwaDebug`。
+    - 验证：`cd dashboard && npx vitest run src/routes/contentTrim.test.ts`（此时应失败）
+    - _需求：10.1_
+  - [ ] 11.2 删除调试页与外链
+    - 改动：删除 `dashboard/src/pages/PwaDebug/`；`dashboard/src/routes/index.tsx` 删除 `PwaDebugPage` 懒加载（≈L33）与 `/pwa-debug` 路由（≈L284）。
+    - 改动：`dashboard/src/components/AvatarDropdown.tsx` 删除 `GITHUB_URL`（≈L53）、文档站菜单项（≈L359-368）、GitHub 菜单项（≈L370-379），以及只在这两处使用的 `CircleHelp`、`Github` 导入；外观、设置、修改密码等其余菜单项不动，`account.helpFeedback`、`account.projectUrl` 两个键保留为孤儿键。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npx vitest run src/routes`
+    - 验证：`! rg -n 'pwa-debug|PwaDebug' dashboard/src && ! rg -n 'github\.com/TencentCloud/Octop|tencentcloud\.github\.io' dashboard/src --glob '!**/locales/**'`
+    - _需求：10.1, 10.2_
+  - [ ] 11.3 删除 `build@0.1.4` 并重生成锁文件（单独一个提交）
+    - 改动：`dashboard/package.json` 的 `dependencies` 删除 `"build": "^0.1.4"`（≈L32），`scripts.build`（≈L8）不动；执行 `make relock PYPI_INDEX=<行内 PyPI 私服地址> NPM_REGISTRY=<行内 npm 私服地址>`（参数与 `w1-02` 上次重生成锁文件时一致）重生成 `dashboard/package-lock.json`，不手改；本 spec 不动 Python 依赖，`uv.lock` 应当无变化。
+    - 验证：`uv run python -c "import json,sys; d=json.load(open('dashboard/package-lock.json', encoding='utf-8')); bad={'build','cssmin','jsmin','jxLoader','moo-server','promised-io','timespan','uglify-js','walker','winston','wrench'}; hits=[k for k in d['packages'] if k.split('node_modules/')[-1] in bad]; print(hits); sys.exit(1 if hits else 0)"`
+    - 验证：`uv run python -c "import json,sys; p=json.load(open('dashboard/package.json', encoding='utf-8')); sys.exit(0 if 'build' not in p['dependencies'] and p['scripts']['build']=='tsc -b && vite build' else 1)"`
+    - 验证：`cd dashboard && npm ci && ! npm ls build && npm run build`
+    - 验证：`git diff --quiet "$W104_BASE" -- uv.lock`
+    - _需求：10.3_
+
+- [ ] 12. 文档：删除引流物料并清除悬空引用（0.5 人日）
+  - 改动：`tests/unit/test_content_trim_guard.py` 的 `REMOVED_REPO_PATHS` 追加 `docs/personas.md` 与 `docs/assets/qrcode.png`（先运行确认失败）。
+  - 改动：删除 `docs/personas.md` 与 `docs/assets/qrcode.png`。
+  - 改动：`README.md` 删除 ≈L147 的 `docs/acp.md` 链接行、≈L211-220 的桌面客户端段落与下载表、≈L312 的客户群目录项、≈L321-322 的"Local script"两行、≈L528-536 的"WeCom Customer Group"一节；`README_CN.md` 对应删除 ≈L147、≈L211-220、≈L305、≈L314-315、≈L522-530。
+  - 改动：`docs/user-guide.md` 删除 ≈L364 的 `docs/acp.md` 链接句、≈L448-453 的客户群问答与有效期提示、≈L477 的图 7.1 行；`docs/user-guide.html` 删除 ≈L474 的链接段；`docs/cli.md` 删除 ≈L420-421 的 ACP 链接句；`docs/architecture.md` 删除 ≈L163-164 两行；`docs/agent-backend-file-io.md` ≈L239 删去"`scripts/install.sh`（及 desktop Linux 安装脚本）会在 **Linux** 上尽力安装 `bubblewrap`；"半句。
+  - 改动：`AGENTS.md` ≈L110 从 `infra/agents/` 的职责中删去 "MBTI personas"；≈L205 把 "A few legacy endpoints (e.g. MBTI) still take `X-Octop-Agent-Id`." 改为 "No backend route reads `X-Octop-Agent-Id`; the agent id always comes from the URL path."。
+  - 改动：`CHANGELOG.md`、`docs/api.md` 不改（全局约束第 5 节）。
+  - 验证：`test ! -e docs/personas.md && test ! -e docs/assets/qrcode.png && ! rg -n -i 'wecom-customer-group|客户企业微信群|企业微信服务群' README.md README_CN.md docs/user-guide.md`
+  - 验证：`! rg -n 'MBTI personas|legacy endpoints \(e\.g\. MBTI\)' AGENTS.md`
+  - 验证（悬空引用检查，需求 11.2）：`! rg -n --hidden -g '!.git/**' -g '!.kiro/**' -g '!**/node_modules/**' -g '!CHANGELOG.md' -g '!CHANGELOG-intranet.md' -g '!docs/api.md' -g '!docs/api-intranet.md' -g '!docs/intranet/**' -g '!tests/unit/test_content_trim_guard.py' -g '!src/octop/infra/agents/subagents/library/**' -e 'desktop/(README\.md|src/|portable/)' -e 'fnos/(README|docker|native)' -e 'scripts[/\\](build-fpk\.sh|fnos/|release_download_links\.py|install(-octop)?\.(sh|ps1|bat))' -e '\.cursor/skills' -e 'personas\.md' -e 'assets/qrcode\.png' -e 'docs/acp\.md|\(\./acp\.md\)|\(acp\.md\)' -e '(octop-desktop|fnos-build-fpk|docker-publish|auto-tag-on-release|sync-main-to-develop|release)\.yml' .`
+  - 验证：`uv run pytest tests/unit/test_content_trim_guard.py -q`
+  - _需求：11.1, 11.2, 11.3_
+
+- [ ] 13. 收尾：全量验证与 fork 记录（1 人日）
+  - 改动：`CHANGELOG-intranet.md` 的 `## [Unreleased]` 下，"移除"分类新增以 `w1-04-content-trim` 开头的条目：MBTI 人格（含 `octop agent create --persona-mbti` 与 `POST/PATCH /api/agents` 的 `persona_mbti` 字段）、主动关怀、7 个专家、5 个子智能体分类、8 个内置插件、`office-automation` 的 `news` 技能、`desktop/` 与 `fnos/`、4 个一键安装脚本、6 个 GitHub 工作流与 `.cursor/`、`/pwa-debug`、头像菜单两个外链、企业微信客户群二维码、`build@0.1.4`；"变更"分类写明 `OCTOP_DESKTOP`、`OCTOP_GREEN_PACKAGES` 失效，`agents.persona_mbti` 列与两张关怀表保留为空，上游 README 与 `docs/` 中对已删功能的描述在行内版不适用。
+  - 改动：`docs/api-intranet.md`："已物理删除的上游路由"列出 `GET /api/mbti/current`、`GET /api/mbti/types`、`GET /api/mbti/types/{code}`、`GET /api/mbti/preview/{code}`、`GET /api/mbti/test/questions`、`POST /api/mbti/test/submit`、`POST /api/mbti/apply`、`GET` 与 `PUT /api/agents/{agent_id}/proactive-care`；"fork 新增或变更的端点"说明 `POST/PATCH /api/agents` 忽略 `persona_mbti`、响应不再含该字段，`GET /api/service/status` 不再含 `desktop`，`POST /api/service/restart` 只在系统服务模式下可用；"鉴权与权限差异"说明后端不再读取 `X-Octop-Agent-Id`。
+  - 验证：`make all`
+  - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test`
+  - 验证：`uv run pytest tests/unit/i18n tests/unit/test_content_trim_guard.py tests/integration/test_removed_routes.py tests/integration/test_content_trim_api.py -q && uv run pytest tests/live --collect-only -q`
+  - 验证：`OCTOP_TEST_DATABASE_URL=postgresql://<专用测试库> make test-postgresql`（本 spec 不改表结构，确认无回归）
+  - 验证：`git diff --quiet "$W104_BASE" -- src/octop/i18n/en.json src/octop/i18n/zh.json dashboard/src/locales/en.json dashboard/src/locales/zh.json CHANGELOG.md docs/api.md src/octop/infra/db/migrations/001_initial.sql src/octop/infra/db/migrations/001_initial.pg.sql tests/unit/db/test_db_pool.py`
+  - 验证：`rg -n 'w1-04-content-trim' CHANGELOG-intranet.md && rg -n '/api/mbti/apply|proactive-care|X-Octop-Agent-Id' docs/api-intranet.md`
+  - 验证（守卫能拦回流）：`mkdir -p src/octop/infra/agents/experts/library/news-trend && ! uv run pytest tests/unit/test_content_trim_guard.py -q; rmdir src/octop/infra/agents/experts/library/news-trend`
+  - 验证（手工冒烟）：全新 `OCTOP_HOME` 下 `uv run octop run` → 登录 → 用 `general-assistant` 模板建 Agent 并对话一轮 → 依次打开专家页（卡片与表格视图）、个性化页各标签、记忆页各标签、插件管理页、管理后台 Agents 表与头像菜单 → 访问 `/personalization/mbti` 落在非 MBTI 标签、访问 `/mbti` 与 `/pwa-debug` 显示 404 页；全程无空分类、无裸 i18n 键、浏览器控制台无报错。
+  - _需求：2.1, 2.2, 11.4, 11.5, 12.1, 12.2_

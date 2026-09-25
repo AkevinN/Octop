@@ -1,0 +1,299 @@
+# 实施计划：高危能力裁剪与横切框架
+
+> spec：`w1-02-capability-trim` ｜ 波次：Wave 1 ｜ 基线：`757fd12` ｜ 预估：16 人日
+> 前置：`w0-01-fork-migration-namespace`、`w0-02-ci-gates`、`w0-03-test-auth-baseline`、`w0-04-fork-isolation-points`、`w1-01-security-hotfix` ｜ 全局约束：`.kiro/steering/intranet-transformation.md`
+
+每个顶层任务完成后可独立提交；提交前运行任务内的验证命令。
+
+顺序说明：任务 3-7 逐类删除，每类一个提交，全程保持 `make all` 全绿；任务 8-13 建框架与数据清洗；任务 14-17 改前端；任务 18 重生成锁文件，必须排在前端删除之后，因为 `@xterm/*` 的唯一消费者要在任务 16 才删。行号均为基线提示，动手前先用 `rg` 定位符号。
+
+- [ ] 1. 确认前置 spec 已合入并记录基线（0.25 人日）
+  - 改动：无代码改动。确认工作分支包含 `757fd12` 与全部前置 spec，打本地标签 `w1-02-base`（本地 ref，不是仓库文件），后续所有 diff 检查以它为基准。把以下命令的输出贴进 PR 描述。
+  - 验证：`git merge-base --is-ancestor 757fd12 HEAD && echo baseline-ok`
+  - 验证：`test -f src/octop/infra/db/fork_migrate.py && test -f src/octop/api/intranet_mounts.py && test -f tests/support/auth_guards.py && test -f CHANGELOG-intranet.md && test -f docs/api-intranet.md && rg -n '^(relock|check-frontend|test-postgresql):' Makefile.intranet`（w0-01 至 w0-04 已合入）
+  - 验证：`git tag -f w1-02-base HEAD`
+  - 验证：`git log --oneline w1-02-base -- src/octop/api/routers/acp.py src/octop/infra/agents/acp_settings.py` 与 `rg -n 'acp' src/octop/config.py tests/unit/api || echo no-acp-refs`（记录 w1-01 对 ACP 做过的改动，任务 3 随 ACP 一并删除）
+  - 验证：`uv run pytest -m "not live" -q` 与 `make check-frontend`（记录基线通过数，作为之后对账的依据）
+  - _需求：13.1, 13.2, 13.3_
+
+- [ ] 2. 配置三触点门禁与重复块修复（测试先行，0.5 人日）
+  - [ ] 2.1 先写门禁测试
+    - 改动：新增 `tests/unit/test_config_touchpoints.py`，内含 `missing_constructor_fields(source: str, dataclass_fields: set[str]) -> set[str]`：用 `ast` 找到 `load_config` 中 `return OctopConfig(...)` 的关键字参数集合，返回 dataclass 字段减去关键字的差集。用例：
+      - `test_octop_config_constructor_covers_all_fields`：对 `src/octop/config.py` 与 `dataclasses.fields(OctopConfig)` 断言差集为空，失败信息列出缺失字段；
+      - `test_checker_reports_missing_field`：对一段只传 `a=` 的合成源码与字段集 `{"a", "b"}` 断言返回 `{"b"}`。
+    - 验证：`uv run pytest tests/unit/test_config_touchpoints.py -q`（基线上即通过；第二个用例证明检查本身有效）
+    - _需求：8.1_
+  - [ ] 2.2 删除重复块
+    - 改动：`src/octop/config.py::load_config` 删除 ≈L523-533 那段与 ≈L511-521 逐字相同的 capabilities 解析与 `OCTOP_ENABLE_MOBILE` 覆盖，只保留一段。行为不变。
+    - 验证：`test "$(rg -c '_parse_capabilities_section\(' src/octop/config.py)" = 2 && uv run pytest tests/unit/test_config.py tests/unit/test_config_touchpoints.py -q`
+    - _需求：8.2_
+
+- [ ] 3. 删除 ACP（0.75 人日）
+  - [ ] 3.1 先写会失败的测试
+    - 改动：新增 `tests/integration/test_removed_routes.py`，用 `env` 夹具构建应用：
+      - 常量 `REMOVED_PREFIXES = ["/api/acp"]`、`REMOVED_AGENT_SEGMENTS = ["/acp"]`，后续删除任务逐项追加；
+      - 断言 `app.routes` 中没有路径以 `REMOVED_PREFIXES` 开头，也没有以 `/api/agents/{agent_id}` 开头且紧接 `REMOVED_AGENT_SEGMENTS` 的路径；
+      - 已登录请求 `GET /api/acp` 返回 404。
+    - 改动：在 `tests/unit/cli/test_registry.py` 用 `test_acp_command_removed` 替换 `test_acp_help_loads`（≈L24-29）：`"acp" not in COMMANDS`，并且 `CliRunner().invoke(cli, ["acp", "--help"]).exit_code != 0`。
+    - 验证：`uv run pytest tests/integration/test_removed_routes.py tests/unit/cli/test_registry.py -q`（此时应失败）
+    - _需求：1.1, 1.3_
+  - [ ] 3.2 删除实现与连带测试
+    - 改动：删除 `src/octop/api/routers/acp.py`、`src/octop/infra/agents/acp_settings.py`、`src/octop/cli/commands/acp.py`；删除 `src/octop/cli/registry.py` 的 `"acp"` 项（≈L34）；删除 `src/octop/api/app.py` import 块中的 `acp`（≈L145）与挂载项（≈L217）。
+    - 改动：`src/octop/infra/agents/manager.py`：删除 `ACPSettingsStore` 的导入（≈L23）、类 docstring 中的 `acp_settings`（≈L324）、`__init__` 与 `replace_persistence` 中的 `self._acp_settings`（≈L369、≈L403）、`acp_settings` property（≈L473-475）、`_build_harness_config` 中从 `acp_section = cfg.get("acp")` 到 `acp_config = ACPConfig.from_dict(...)` 的整块（≈L2836-2846），以及 `HarnessAgentConfig(...)` 的 `acp_runners=` 与 `acp_delegate_enabled=` 两个关键字参数（≈L2938-2939），让 harness 取默认值 `False`。
+    - 改动：删除 `tests/integration/test_acp_api.py`、`tests/unit/agents/test_acp_settings.py`，以及 w1-01 如果新增过的 ACP 专项测试（如 `tests/unit/api/test_acp_admin_delegation.py`）；删除 `tests/integration/conftest.py::env_acp_agent`（≈L183-190）；从 `tests/unit/api/test_acl_gate_coverage.py` 的 `GATED_FILES` 删去 `routers/acp.py`（≈L42）。如果 w1-01 在 `config.py` 新增过 ACP 专用配置键，按三触点同批删除。
+    - 改动：在 `tests/unit/agents/test_agent_manager.py` 追加 `test_build_harness_config_has_no_acp_delegate`：`manager._build_harness_config(row).acp_delegate_enabled is False`。
+    - 验证：`uv run pytest tests/integration/test_removed_routes.py tests/unit/cli/test_registry.py tests/unit/api/test_acl_gate_coverage.py tests/unit/agents/test_agent_manager.py -q`
+    - 验证：`test ! -e src/octop/api/routers/acp.py && test ! -e src/octop/infra/agents/acp_settings.py && test ! -e src/octop/cli/commands/acp.py && ! rg -n 'acp_settings|ACPSettingsStore|harness_agent\.acp' src`
+    - 验证：`! uv run octop acp --help`
+    - 验证：`make all`
+    - _需求：1.1, 1.3, 1.4, 2.1, 2.3_
+
+- [ ] 4. 删除 Web 终端（0.5 人日）
+  - 改动：先在 `tests/integration/test_removed_routes.py` 的 `REMOVED_AGENT_SEGMENTS` 追加 `"/terminal"`，加上"已登录请求 `GET /api/agents/{id}/terminal/context` 返回 404"与"`enable_api_docs=True` 时 OpenAPI 的 `tags` 不含 `terminal`"两条断言，确认它们会失败。
+  - 改动：删除 `src/octop/api/routers/terminal.py`；删除 `app.py` import 块中的 `terminal`（≈L185）与挂载项（≈L259）；删除 `src/octop/api/openapi_meta.py` 中的 `terminal` tag（≈L143）。
+  - 改动：`src/octop/infra/utils/posix_compat.py` 的模块 docstring（≈L4）去掉对 `octop.api.routers.terminal.terminal_supported` 的引用，改为"调用方须自行以 `os.name == "posix"` 守卫"；8 个孤儿函数保留不动（design.md "删除边界"）。
+  - 改动：删除 `tests/integration/test_terminal_ws.py`、`tests/integration/test_terminal_context.py`、`tests/unit/api/test_terminal_platform.py`、`tests/unit/api/test_terminal_sessions.py`；删除 `tests/integration/conftest.py::env_terminal`（≈L224-231），并删掉 `tests/integration/test_auth_baseline.py` 中 w0-03 为 `env_terminal` 应用写的替身断言与它专用的 `probe_override` 夹具（`octop_client` 分支保留）；清理因此不再使用的 `build_app` 与 `apply_test_dependency_overrides` 导入；删除 `tests/integration/test_agents_shared.py` 中请求 `/terminal/context` 并断言 403 的一段（≈L124-128）；从 `GATED_FILES` 删去 `routers/terminal.py`（≈L41）。
+  - 验证：`uv run pytest tests/integration/test_removed_routes.py tests/integration/test_agents_shared.py tests/integration/test_auth_baseline.py tests/unit/utils/test_posix_compat.py tests/unit/api/test_acl_gate_coverage.py -q`
+  - 验证：`test ! -e src/octop/api/routers/terminal.py && ! rg -n 'routers\.terminal|terminal_supported|env_terminal' src tests`
+  - 验证：`make all`
+  - _需求：1.1, 1.2, 1.4, 1.5_
+
+- [ ] 5. 删除远程手机（0.75 人日）
+  - 改动：先在 `tests/integration/test_removed_routes.py` 的 `REMOVED_PREFIXES` 追加 `"/api/mobile"`、`"/api/mobile-stream"`，并把 `enable_api_docs=True` 时的 tag 断言扩展到 `mobile`，确认会失败。
+  - 改动：删除 `src/octop/api/routers/mobile/`、`src/octop/infra/mobile/`（含 `scripts/`；它不在 hatch include 中，无需改 `pyproject.toml`）与 `docker/docker-compose.mobile.yml`；删除 `app.py` import 块中的 `mobile`（≈L171）、`enable_mobile` 变量（≈L105-106）与整个 `if enable_mobile:` 块（≈L270-276）；删除 `openapi_meta.py` 中的 `mobile` tag（≈L150）。
+  - 改动：`src/octop/infra/server.py`：删除 `ensure_mobile_capabilities_probed` 的导入（≈L26），把 ≈L294 改为 `config = load_config(self.paths.config)`（`load_config` 已在 ≈L16 导入）。
+  - 改动：`manager.py::_build_harness_config`：删除 `mobile_tools` 块（≈L2733-2741）、`sanitize_plugin_tool_names` 的 `reserved` 集合中的 `*mobile_tools`（≈L2782）与 `merged_tools.extend(mobile_tools)`（≈L2832）。`config.py` 的 `MobileCapabilities` 与 `agent_tools.py`（≈L83）、`settings.py` 对它的读取暂留，任务 8 统一改造。
+  - 改动：删除 `tests/unit/mobile/` 整个目录（10 个文件）。`tests/unit/i18n/test_mobile.py` 只断言 i18n 键，保留。
+  - 改动：在 `tests/unit/agents/test_agent_manager.py` 追加 `test_build_harness_config_has_no_mobile_tools`：返回值 `tools` 中没有 `mobile_` 前缀的工具名。
+  - 验证：`uv run pytest tests/integration/test_removed_routes.py tests/unit/agents/test_agent_manager.py tests/unit/test_config.py -q`
+  - 验证：`test ! -e src/octop/infra/mobile && test ! -e src/octop/api/routers/mobile && test ! -e docker/docker-compose.mobile.yml && ! rg -n 'octop\.infra\.mobile|config_probe|mobile_tools|enable_mobile' src`
+  - 验证：`make all`
+  - _需求：1.1, 1.2, 1.4, 2.1, 2.2, 2.3, 6.5_
+
+- [ ] 6. 删除远程桌面（0.5 人日）
+  - 改动：先在 `REMOVED_PREFIXES` 追加 `"/api/desktop"`、`"/api/desktop-stream"`，把 tag 断言扩展到 `desktop`，确认会失败。
+  - 改动：删除 `src/octop/api/routers/desktop/` 与 `src/octop/infra/desktop/`（含 `scripts/linux`）；删除 `app.py` import 块中的 `desktop`（≈L159）与挂载项（≈L263）；删除 `openapi_meta.py` 中的 `desktop` tag（≈L154）。hatch include 的 `desktop/scripts` 行在任务 18 与依赖一并清理（hatch 对不存在的 glob 不报错）。
+  - 改动：删除 `tests/unit/desktop/` 下的 `test_capture.py`、`test_capture_display.py`、`test_input.py`、`test_native_platform.py`、`test_session.py`、`test_setup.py` 这 6 个文件；**保留** `tests/unit/desktop/test_stamp_version.py`，不得 `rm -rf` 整个目录；从 `GATED_FILES` 删去 `routers/desktop/{install,uninstall,status,settings}.py` 四行（≈L33-36）。`ErrorCode.DESKTOP_SESSION_LIMIT` 与 `DESKTOP_CAPTURE_FAILED` 保留。
+  - 验证：`uv run pytest tests/integration/test_removed_routes.py tests/unit/desktop/test_stamp_version.py tests/unit/api/test_acl_gate_coverage.py tests/unit/i18n -q`
+  - 验证：`test ! -e src/octop/infra/desktop && test ! -e src/octop/api/routers/desktop && test -f tests/unit/desktop/test_stamp_version.py && test -d desktop && ! rg -n 'octop\.infra\.desktop' src tests`
+  - 验证：`make all`
+  - _需求：1.1, 1.2, 1.4, 1.5, 13.2_
+
+- [ ] 7. 删除浏览器自动化与远程浏览器（含 `BrowserProfileMiddleware`，1.0 人日）
+  - [ ] 7.1 先迁移保留函数的测试，并写会失败的测试
+    - 改动：新增 `tests/unit/utils/test_browser_profiles_dir.py`，从 `tests/unit/browser/test_browser_setup.py` 迁入覆盖保留函数的 4 组用例：`test_configure_browser_idle_timeout_updates_harness`（≈L29）、`test_octop_browser_profiles_dir_shared`（≈L328）、`test_configure_browser_profiles_dir_sets_env`（≈L343）、`test_legacy_profiles_migrated_once`（≈L356）。再补一例"`api/routers/channels.py::_resolve_profiles_root` 在无环境变量覆盖时返回 `octop_browser_profiles_dir()`"。路径一律用 `tmp_path` 与 `Path` 比较（AGENTS.md §7 跨平台规则）。
+    - 改动：在 `REMOVED_PREFIXES` 追加 `"/api/browser"`、`"/api/browser-stream"`，把 tag 断言扩展到 `browser`，加上"已登录请求 `GET /api/browser/env-status` 返回 404"。在 `tests/unit/agents/test_agent_manager.py` 追加 `test_build_harness_config_has_no_browser_profile_middleware`：中间件列表中没有类名为 `BrowserProfileMiddleware` 的实例。
+    - 验证：`uv run pytest tests/unit/utils/test_browser_profiles_dir.py -q`（应通过）；`uv run pytest tests/integration/test_removed_routes.py tests/unit/agents/test_agent_manager.py -q`（应失败）
+    - _需求：1.5, 2.1_
+  - [ ] 7.2 同一提交内删除路由、中间件与孤儿函数
+    - 改动：删除 `src/octop/api/routers/browser/`、`src/octop/infra/browser/`、`src/octop/infra/agents/middleware/browser_profile.py`；删除 `app.py` import 块中的 `browser`（≈L154）与挂载项（≈L262）；删除 `openapi_meta.py` 中的 `browser` tag（≈L146）。
+    - 改动：`manager.py::_build_harness_config`：删除 `BrowserProfileMiddleware` 的导入（≈L2798）与列表项 `BrowserProfileMiddleware(),`（≈L2819）。`_agent_runtime_bundle` 中的 `browser_media` 调用块（≈L2568-2579）保留。
+    - 改动：`src/octop/infra/utils/browser_media.py`：删除 `parse_octop_user_id`（≈L21-31）、`user_browser_profile`（≈L34-41）、`harness_settings_for_screenshots_dir`（≈L144-150），其余函数不动。
+    - 改动：删除 `tests/integration/test_browser_api.py`、`tests/integration/test_browser_record_replay_api.py`、`tests/unit/api/test_browser_stream_listen.py`、`tests/unit/api/test_browser_stream_mouse.py`、`tests/unit/api/test_harness_tabs.py`、`tests/unit/agents/test_browser_profile_middleware.py`、`tests/unit/browser/`；从 `GATED_FILES` 删去 `routers/browser/uninstall.py`、`routers/browser/env.py`（≈L31-32）；把 `tests/conftest.py::_SLOW_TEST_MODULES` 中的 `tests/unit/browser/test_browser_setup.py`（≈L17）一行删除。
+    - 验证：`uv run pytest tests/integration/test_removed_routes.py tests/unit/agents tests/unit/utils tests/unit/gateway tests/unit/api/test_acl_gate_coverage.py -q`
+    - 验证：`test ! -e src/octop/infra/browser && test ! -e src/octop/api/routers/browser && ! rg -n 'user_browser_profile|parse_octop_user_id|harness_settings_for_screenshots_dir|BrowserProfileMiddleware|octop\.infra\.browser' src tests`
+    - 验证：`uv run pytest tests/unit/desktop/test_stamp_version.py tests/unit/utils/test_posix_compat.py tests/unit/utils/test_browser_profiles_dir.py -q`
+    - 验证：`make all`
+    - _需求：1.1, 1.2, 1.4, 1.5, 2.1, 2.3_
+
+- [ ] 8. 能力目录、配置解析与只读查询接口（测试先行，1.0 人日）
+  - [ ] 8.1 先写会失败的测试
+    - 改动：新增 `tests/unit/test_capabilities_config.py`，用 `monkeypatch.setitem(CAPABILITY_CATALOG, "probe_cap", CapabilitySpec(...))` 注入测试能力，覆盖以下情形：缺省取 `default_enabled`；文件 `{"probe_cap": {"enabled": false}}` 生效；`OCTOP_CAPABILITY_PROBE_CAP=1` 覆盖文件值；未知名、`agent_shell` 等保留名（消息含 owner spec）、值不是对象、`enabled` 为字符串，都抛 `ValueError`；环境中出现未知名或保留名的 `OCTOP_CAPABILITY_*`、以及 `OCTOP_CAPABILITY_PROBE_CAP=maybe`，都抛 `ValueError`，且消息不含变量值；`{"mobile": {"enabled": true, "backend": "redroid"}}` 被忽略并产生一条 WARNING（`caplog`）；文件不存在时写出的 `capabilities` 段等于 `capability_file_defaults()`（合入时为 `{}`）；`RESERVED_CAPABILITIES` 至少含 5 个名字，与目录、与 `LEGACY_CAPABILITY_KEYS` 都不相交；`octop/capability_catalog.py` 经 `ast` 检查只导入标准库。
+    - 改动：新增 `tests/unit/test_capabilities.py`：`REMOVED_CAPABILITY_TOOLS` 恰为需求 4.1 的 11 个名字；关闭的测试能力的 `tools` 并入 `forced_disabled_tools`，开启时不并入；强制集与 `CRITICAL_TOOLS` 不相交；`capability_enabled` 对未知名与保留名抛 `RuntimeError`；`cfg=None` 时取默认值。
+    - 改动：`tests/unit/test_config.py`：把 `test_loads_mobile_capabilities`（≈L392-410）改写为 `test_legacy_mobile_capability_is_ignored`。
+    - 改动：新增 `tests/integration/test_settings_capabilities_api.py`：已登录 `GET /api/settings/capabilities` 返回 200 与 `{"capabilities": {}}`；未登录返回 401。再加一条单测，用假 server 对象与注入的测试能力调用 `get_capabilities`，断言形状为 `{"capabilities": {"probe_cap": {"enabled": false}}}`，且不含保留名。
+    - 验证：`uv run pytest tests/unit/test_capabilities_config.py tests/unit/test_capabilities.py tests/unit/test_config.py tests/integration/test_settings_capabilities_api.py -q`（此时应失败）
+    - _需求：6.1, 6.2, 6.3, 6.4, 6.6, 7.4_
+  - [ ] 8.2 实现
+    - 改动：新增 `src/octop/capability_catalog.py`（只导入标准库），实现 design.md 中的 `CapabilitySpec`、空的 `CAPABILITY_CATALOG`、`RESERVED_CAPABILITIES`（`agent_shell`、`content_security`、`intranet_im`、`intranet_connectors`、`frontend_controls` 及其 owner）、`LEGACY_CAPABILITY_KEYS`、`ENV_PREFIX`、`parse_capability_flags`、`capability_file_defaults`。
+    - 改动：`src/octop/config.py` 的三触点：
+      - 触点一：删除 `_VALID_MOBILE_BACKENDS`（≈L106）与 `MobileCapabilities`（≈L109-117）；`CapabilitiesConfig`（≈L119-121）改为 `enabled: dict[str, bool] = field(default_factory=dict)`；`OctopConfig.capabilities`（≈L143）的声明不变。
+      - 触点二：删除 `_parse_mobile_capabilities`（≈L185-201）；`_parse_capabilities_section`（≈L203）改为 `(raw, environ) -> CapabilitiesConfig`，委托 `parse_capability_flags`；`load_config` 中剩下的那段 capabilities 解析与 `OCTOP_ENABLE_MOBILE` 覆盖（≈L511-521）改为一行 `capabilities = _parse_capabilities_section(raw.get("capabilities"), os.environ)`。
+      - 触点三：`return OctopConfig(...)` 中的 `capabilities=capabilities`（≈L615）保持不变，由任务 2 的门禁测试兜住。
+      - `_defaults_for_file`（≈L152）：在 `data` 中把 `capabilities` 改写为 `capability_file_defaults()`。
+    - 改动：新增 `src/octop/infra/capabilities.py`：`capability_enabled`、`enabled_capabilities`、`REMOVED_CAPABILITY_TOOLS`、`forced_disabled_tools`，只依赖 `octop.config` 与 `octop.capability_catalog`。
+    - 改动：`src/octop/api/routers/settings.py`：删除 `MobileCapabilitiesResponse`（≈L58）；`CapabilitiesResponse`（≈L63）改为 `capabilities: dict[str, CapabilityView]`（`CapabilityView.enabled: bool`，用 `Field(description=...)` 说明"由部署配置决定、只读"）；`get_capabilities`（≈L72）遍历 `enabled_capabilities(cfg)`，`summary` 与 `Depends(current_user)` 保持不变。
+    - 改动：`src/octop/api/routers/agent_tools.py`：删除 ≈L83 的 `mobile_enabled` 与 ≈L100 的传参（`tool_catalog` 的签名在任务 11 改）。
+    - 验证：`uv run pytest tests/unit/test_capabilities_config.py tests/unit/test_capabilities.py tests/unit/test_config.py tests/unit/test_config_touchpoints.py tests/integration/test_settings_capabilities_api.py -q`
+    - 验证：`test "$(rg -c '_parse_capabilities_section\(' src/octop/config.py)" = 2 && ! rg -n 'OCTOP_ENABLE_MOBILE|MobileCapabilities|\.capabilities\.mobile' src tests`
+    - 验证：`make all`
+    - _需求：6.1, 6.2, 6.3, 6.4, 6.6, 7.4, 8.2, 2.3_
+
+- [ ] 9. 能力开关的运行时闸门（测试先行，1.0 人日）
+  - [ ] 9.1 先写会失败的测试
+    - 改动：新增 `tests/support/capability_probe.py`，提供一个只含 `GET /probe/ping` 的 `router`，以及 `register_probe_capability(monkeypatch, *, default_enabled: bool)`：向 `CAPABILITY_CATALOG` 注入 `probe_cap`。
+    - 改动：新增 `tests/unit/api/test_capability_gate.py`：
+      - `_mount_if_capable`：能力开启时 `/api/probe/ping` 在 `app.routes` 中、关闭时不在；router 被 monkeypatch 进 w0-04 的 `_FORK_DISABLED_MOUNTS` 后，即使能力开启也不挂载；未知名与保留名在调用时抛 `RuntimeError`。
+      - `FORK_CAPABILITY_MOUNTS`：monkeypatch 为 `(CapabilityMount("probe_cap", "tests.support.capability_probe:router", "/api", ("probe",)),)` 后，`build_app` 按能力开关决定是否挂载。
+      - `require_capability("probe_cap")`：挂在一个测试路由上，能力关闭时返回 404 且 JSON 信封的 `code` 为 `NOT_FOUND`、响应体不含 `probe_cap`；开启时返回 200；对未知名调用工厂即抛 `RuntimeError`。
+      - 只读：遍历真实 `build_app` 的 `app.routes`，路径含 `capabilities` 的路由方法集合只有 `{"GET"}`。
+    - 验证：`uv run pytest tests/unit/api/test_capability_gate.py -q`（此时应失败）
+    - _需求：7.1, 7.2, 7.3, 6.5_
+  - [ ] 9.2 实现
+    - 改动：`src/octop/api/deps.py`：在 `require_admin`（≈L222）之后新增 `require_capability(name)`。工厂被调用时校验名字在 `CAPABILITY_CATALOG` 中（否则 `RuntimeError`，与 `require_permission` 同风格）；运行时经 `get_server` 读 `server.services.config`，能力关闭时 `logger.info` 记录能力名并抛 `OctopError(ErrorCode.NOT_FOUND, "not found")`。
+    - 改动：新增 `src/octop/api/capability_mounts.py`：`CapabilityMount` 与空的 `FORK_CAPABILITY_MOUNTS`。
+    - 改动：`src/octop/api/app.py`：在 `_mount_routers`（≈L72）之后新增 `_mount_if_capable(app, cfg, capability, mounts)`，先校验名字，再在能力开启时调用 `_mount_routers`；在主挂载列表之后（原 `if enable_mobile:` 的位置）逐项处理 `FORK_CAPABILITY_MOUNTS`，用 w0-04 的 `resolve_router_ref` 解析引用。
+    - 验证：`uv run pytest tests/unit/api/test_capability_gate.py tests/unit/api/test_intranet_mounts.py tests/integration/test_settings_capabilities_api.py tests/integration/test_scalar.py -q`
+    - 验证：`make all`
+    - _需求：7.1, 7.2, 7.3, 6.5_
+
+- [ ] 10. agent 中间件注册式装配与执行守卫（测试先行，1.0 人日）
+  - [ ] 10.1 先写会失败的测试
+    - 改动：新增 `tests/unit/agents/test_forced_tool_guard.py`（仿照已删除的 `test_browser_profile_middleware.py` 构造 `ToolCallRequest`）：`awrap_tool_call` 与 `wrap_tool_call` 对 `browser_use` 返回 `ToolMessage(status="error")`，`tool_call_id` 与请求一致，handler 未被调用；对 `read_file` 原样调用 handler。
+    - 改动：新增 `tests/unit/agents/test_middleware_registry.py`：用 monkeypatch 替换 `FORK_AGENT_MIDDLEWARE`，断言顺序为 `[outer 按 order, *upstream, inner 按 order]`；`name` 重复时抛 `RuntimeError`；声明未知能力时抛 `RuntimeError`；声明的测试能力关闭时该项不装配；工厂返回 `None` 时跳过；真实登记表的首项是 `ForcedToolGuardMiddleware`，其 `denied` 等于 `forced_disabled_tools(config)`。
+    - 改动：在 `tests/unit/agents/test_agent_manager.py` 追加：`_build_harness_config(row).middleware[0]` 是 `ForcedToolGuardMiddleware`。
+    - 验证：`uv run pytest tests/unit/agents/test_forced_tool_guard.py tests/unit/agents/test_middleware_registry.py tests/unit/agents/test_agent_manager.py -q`（此时应失败）
+    - _需求：4.3, 9.1, 9.2_
+  - [ ] 10.2 实现
+    - 改动：新增 `src/octop/infra/agents/middleware/forced_tool_guard.py::ForcedToolGuardMiddleware`（该目录是命名空间包，无需 `__init__`）。
+    - 改动：新增 `src/octop/infra/agents/middleware_registry.py`：`AgentMiddlewareContext`、`AgentMiddlewareSpec`、`FORK_AGENT_MIDDLEWARE`（登记 `AgentMiddlewareSpec("forced_tool_guard", "outer", 0, factory)`）、`assemble_agent_middleware`。
+    - 改动：`manager.py::_build_harness_config`：在 `agent_middleware` 列表字面量之后（≈L2826）加一条 `agent_middleware = assemble_agent_middleware(agent_middleware, AgentMiddlewareContext(...))`，此外不改列表本身。
+    - 验证：`uv run pytest tests/unit/agents -q`
+    - 验证：`test "$(rg -c 'assemble_agent_middleware\(' src/octop/infra/agents/manager.py)" = 1`
+    - 验证：`make all`
+    - _需求：4.3, 9.1, 9.2, 9.3_
+
+- [ ] 11. `forced_disabled_tools` 贯通同步路径、工具设置与 HITL 目录（测试先行，1.0 人日）
+  - [ ] 11.1 先写会失败的测试
+    - 改动：新增 `tests/unit/agents/test_forced_tool_denylist.py`：
+      - `_build_harness_config(row).tools_disabled` 包含 `forced_disabled_tools(manager._config)`；把 agent 配置的 `tools_disabled` 置为 `[]` 后重新组装，仍然包含；
+      - 以 `MagicMock` 替换运行中 agent（写法同 `test_persist_tools_disabled_strips_critical_and_hot_syncs`），调用 `persist_tools_disabled`、`persist_plugin_tools_config`、`sync_tools_disabled` 后，`set_tools_disabled` 收到的集合都是强制集的超集；
+      - monkeypatch `manager._HARNESS_AGENT_CONFIG_FIELDS` 去掉 `tools_disabled` 后，`_build_harness_config` 抛 `RuntimeError`。
+    - 改动：`tests/unit/agents/test_agent_manager.py::test_persist_tools_disabled_strips_critical_and_hot_syncs`（≈L1205-1226）：把 `set_tools_disabled` 的期望值改为 `{"execute", "web_fetch"} | REMOVED_CAPABILITY_TOOLS`，持久化的 `tools_disabled` 仍然断言为 `["execute", "web_fetch"]`。
+    - 改动：`tests/unit/agents/test_tool_catalog.py::test_builtin_tool_available_gates`（≈L69-88）：删除 `mobile_tap` 与 `acp_runner` 两段，其余按新签名改写；新增"`forced` 命中时返回 `False`"与"`BUILTIN_TOOL_CATALOG` 与 `REMOVED_CAPABILITY_TOOLS` 不相交"。
+    - 改动：新增 `tests/integration/test_tool_settings_api.py`：`GET /api/agents/{id}/tool-settings` 不含 11 个已删名；monkeypatch `forced_disabled_tools` 使 `web_fetch` 进入强制集后，该条目为 `available=false`、`enabled=false`、`disableable=false`，`PATCH .../tool-settings/web_fetch {"enabled": true}` 返回 400，并且读回的 agent 配置中 `tools_disabled` 不变；`GET /api/admin/security/defaults` 的 `hitl_tool_catalog` 不含 `browser_use` 与 `desktop_screenshot`。
+    - 验证：`uv run pytest tests/unit/agents/test_forced_tool_denylist.py tests/unit/agents/test_agent_manager.py tests/unit/agents/test_tool_catalog.py tests/integration/test_tool_settings_api.py -q`（此时应失败）
+    - _需求：4.1, 4.2, 4.4, 5.1, 5.2, 5.3_
+  - [ ] 11.2 实现
+    - 改动：`manager.py::sync_tools_disabled`（≈L2149）：调用 setter 前把 `disabled` 与 `forced_disabled_tools(self._config)` 取并集。`manager.py::_build_harness_config`（≈L2948-2956）：`harness_cfg.tools_disabled` 取 `effective_tools_disabled(...)` 与强制集的并集；字段不存在而强制集非空时抛 `RuntimeError`。
+    - 改动：`src/octop/infra/agents/tool_catalog.py`：删除 `_MOBILE_TOOLS`（≈L33-42），从 `BUILTIN_TOOL_CATALOG` 删去 `browser_use`（≈L66）、`desktop_screenshot`（≈L67）、`acp_runner`（≈L81）与 6 个 `mobile_*`（≈L90-95）；`builtin_tool_available`（≈L185）改为 `(name, *, agent_cfg, forced=frozenset())`，删去 `mobile_enabled` 与 `acp_runner` 分支，命中 `forced` 时返回 `False`。
+    - 改动：`src/octop/api/routers/agent_tools.py`：GET 计算一次 `forced = forced_disabled_tools(server.config)`，强制集内的条目设 `available=False`、`enabled=False`、`disableable=False`；PATCH 的 builtin 分支在 `CRITICAL_TOOLS` 检查之后加一段：`body.enabled` 为真且 `name in forced` 时抛 `HTTPException(status_code=400, detail=f"tool {name!r} is disabled by host policy")`。PUT 不改。
+    - 改动：`src/octop/api/routers/security.py::get_security_defaults`（≈L191-205）：生成 `hitl_tool_catalog` 时跳过 `forced_disabled_tools(server.services.config)` 中的名字。`i18n/domains/tools.py` 与 `tests/unit/i18n/test_tools.py` 不改。
+    - 验证：`uv run pytest tests/unit/agents tests/integration/test_tool_settings_api.py tests/unit/i18n -q`
+    - 验证：`make all`
+    - _需求：4.1, 4.2, 4.4, 5.1, 5.2, 5.3, 2.1_
+
+- [ ] 12. 子代理可达的已删 harness 工具中和（测试先行，0.5 人日）
+  - 改动：先写 `tests/unit/agents/test_harness_removed_tools.py`。先用 `monkeypatch.setattr` 登记 `harness_agent.agent.browser_use` 与 `build_desktop_screenshot_tool` 的原值，保证用例结束后恢复。用例：调用 `neutralize_removed_harness_tools()` 后，`browser_use` 的 `name` 与 `args_schema` 与原工具相同，`invoke` 与 `ainvoke` 返回含 "removed" 的文本；`build_desktop_screenshot_tool(<假 workspace>)` 返回名为 `desktop_screenshot` 的中和桩；重复调用幂等；`monkeypatch.delattr` 掉任一目标属性后调用抛 `RuntimeError`；`inspect.getsource(HarnessAgent._build_tools)` 仍包含 `browser_use` 与 `build_desktop_screenshot_tool(`（harness 升级后契约失效即变红）。
+  - 改动：新增 `src/octop/infra/agents/harness_removed_tools.py::neutralize_removed_harness_tools`；在 `src/octop/infra/server.py::_boot_runtime` 中、`configure_browser_idle_timeout(...)`（≈L371）之后、创建 `AgentManager` 之前调用一次。模块 docstring 写明它是过渡措施，删除条件是 `w2-01` 的 harness 内部分支合入。
+  - 验证：`uv run pytest tests/unit/agents/test_harness_removed_tools.py tests/integration/test_agents_shared.py -q`
+  - 验证：`make all`
+  - _需求：4.5_
+
+- [ ] 13. 删除权限键并用 fork 迁移清洗存量（测试先行，1.0 人日）
+  - [ ] 13.1 先写会失败的测试
+    - 改动：新增 `tests/unit/db/test_fork_drop_removed_capability_data.py`（SQLite）：在 `tmp_path` 的库上执行 `run_migrations`；用 `UserRepo.create` 建两个用户，`permissions` 分别为 `["browser", "users", "terminal"]` 与 `["connectors"]`；向 `settings` 插入 `acp_runners:user:1`、`acp_runnersXuser:2`、`active_stt_provider` 三行；用 `set_fork_version` 把水位退到本迁移之前，再执行 `run_migrations`。断言第一个用户变为 `["users"]`、第二个不变；只删除了 `acp_runners:user:1`；再执行一次结果不变。另用 w0-01 的 users-only 残缺库形态建库，执行后不报错。本迁移的版本号用 `discover_fork_migrations("sqlite")` 按文件名后缀 `_drop_removed_capability_data.sql` 查找，不写死。
+    - 改动：新增 `tests/integration/test_removed_permission_keys.py`：在 `env` 夹具下用 `srv.services.user_repo.create(..., permissions=["browser", "users"])` 建老用户，管理员以 `GET /api/users/{id}` 的 `permissions` 原样 `PATCH`，断言返回 400（记录问题）；把 fork 水位退回后执行 `run_migrations(srv.services.db)`，再次 `GET` 加 `PATCH`，断言返回 200 且读回为 `["users"]`。
+    - 改动：新增 `tests/integration/test_postgresql_fork_capability_trim.py`（带 `@requires_postgresql` 与 `@pytest.mark.postgresql`，照抄 `tests/integration/test_postgresql_control_plane.py` 的 `_reset_public_schema`）：在 JSONB 列上执行同样的断言。
+    - 改动：`tests/unit/users/test_permissions.py`：≈L40-41 与 ≈L83-85 的 `"browser"` 改为 `"connectors"`；≈L64-69 的 control 集合断言改为 `== set()`；新增 `assert not {"terminal", "browser", "desktop", "mobile"} & set(PERMISSIONS)`。`tests/unit/api/test_permissions_api.py`：≈L28 与 ≈L36 的 `require_permission("browser")` 及对应 `details` 断言改为 `"connectors"`。`tests/unit/db/test_user_permissions_column.py` 不改（`UserRepo` 不做键校验）。
+    - 验证：`uv run pytest tests/unit/db/test_fork_drop_removed_capability_data.py tests/integration/test_removed_permission_keys.py tests/unit/users/test_permissions.py -q`（此时应失败）
+    - _需求：3.1, 3.2, 3.3_
+  - [ ] 13.2 实现
+    - 改动：`src/octop/infra/users/permissions.py`：删除 `PERMISSIONS` 的 ≈L56-60（control 分组注释与四个键），保留 ≈L61 的 admin 分组注释；模块 docstring 的举例（≈L3）改为 `"connectors"`，≈L7 的分类列表去掉 `control`。
+    - 改动：新增 `src/octop/infra/db/migrations/forkNNN_drop_removed_capability_data.sql` 与 `.pg.sql`（号按合入时下一个可用号），内容为 design.md"数据模型"中的 DELETE 语句。
+    - 改动：新增 `src/octop/infra/db/fork_steps.py`：`strip_permission_keys(conn, dialect, removed)` 与 `drop_removed_capability_permissions(conn, dialect)`；在 `src/octop/infra/db/fork_migrate.py::_FORK_PY_STEPS` 用同一版本号登记后者。
+    - 验证：`uv run pytest tests/unit/db tests/integration/test_removed_permission_keys.py tests/unit/users tests/unit/api/test_permissions_api.py tests/unit/api/test_acl_gate_coverage.py -q`
+    - 验证：`uv run python -c "from octop.infra.users.permissions import PERMISSIONS as P; assert not {'terminal','browser','desktop','mobile'} & set(P); assert not [k for k, p in P.items() if p.category == 'control']; print(len(P))"`（输出 22）
+    - 验证：设置 `OCTOP_TEST_DATABASE_URL` 后执行 `make test-postgresql`
+    - 验证：`make all`
+    - _需求：3.1, 3.2, 3.3, 3.4_
+
+- [ ] 14. 前端：`ChatDockPanelShell` 与 `PanelMode` 迁出（行为不变，0.5 人日）
+  - 改动：`git mv dashboard/src/components/BrowserWorkspace/ChatDockPanelShell.tsx dashboard/src/components/ChatDockPanelShell/ChatDockPanelShell.tsx`，同样迁移 `ChatDockPanelShell.test.tsx`；把 `ChatBrowserPanel.module.less` 迁为 `dashboard/src/components/ChatDockPanelShell/ChatDockPanelShell.module.less`（类名不变）；新增 `dashboard/src/components/ChatDockPanelShell/types.ts` 导出 `PanelMode`。
+  - 改动：外壳内的相对导入改为新路径：`PanelMode` 从 `./types` 导入，`usePointerDragSession`、`useDesktopChrome`、`utils/desktopChrome` 的路径层级不变。`components/BrowserWorkspace/index.tsx` 改为 `export type { PanelMode } from "../ChatDockPanelShell/types"`；`ChatBrowserPanel.tsx` 的外壳导入改到新位置（这两个文件在任务 16 删除）。
+  - 改动：`pages/Chat/components/ChatDockPanel.tsx`（≈L23-26）、`pages/Chat/components/ChatDockPanels.tsx`（≈L1）、`pages/Chat/hooks/useChatDockPanel.ts`（≈L2）改为从 `components/ChatDockPanelShell/` 导入外壳与 `PanelMode`。
+  - 验证：`cd dashboard && npx tsc -b && npx vitest run src/components/ChatDockPanelShell src/pages/Chat`
+  - 验证：`test -f dashboard/src/components/ChatDockPanelShell/ChatDockPanelShell.tsx && test -f dashboard/src/pages/Chat/chatBrowserPanel.partial.less`
+  - _需求：10.3, 10.5_
+
+- [ ] 15. 前端：聊天页与 dock 手术（测试先行，1.0 人日）
+  - 改动：先改测试。`pages/Chat/hooks/useChatDockPanel.test.ts`：删除 `toggleBrowserPanel`、`toggleTerminalPanel`、`openTerminalTab` 三组用例，把借用 `openBrowserTab` 验证通用关闭与回退逻辑的用例（≈L139、≈L152、≈L209、≈L237）改用 `openFileAt` 或 `openKnowledgeCitation`。`pages/Chat/components/ChatDockPanels.keepAlive.test.tsx`：`baseProps` 改为 `openTabs: [{ id: "files", kind: "files" }]`，删去 `browserEnvironment`，保留"关闭后仍挂载"与"切换布局不重挂载"两个用例。
+  - 改动：`pages/Chat/hooks/useChatDockPanel.ts`：从 `DockTab` 删去 `browser` 与 `terminal` 两个变体（≈L24-25），删除 `openBrowserTab`、`openTerminalTab`、`toggleDockTab`、`toggleBrowserPanel`、`toggleTerminalPanel` 及其在返回值中的导出；两个 legacy localStorage 键保留。
+  - 改动：按 `tsc` 报出的位置逐个删除：`pages/Chat/components/ChatDockPanel.tsx` 的 `BrowserWorkspace` 与 `browserProfile` 导入、`TerminalPage` 懒加载（≈L38）、`browserEnvironment` prop、`browserMounted` / `terminalMounted` 状态与同步、浏览器与终端的 tab 标题、工具条与渲染分支；`ChatDockPanels.tsx` 的 `DisplayEnvironment` 导入与 `browserEnvironment` 透传（≈L2、≈L20、≈L54、≈L90）。
+  - 改动：`pages/Chat/index.tsx`：删除 `useBrowserToolDetection`、`useSkillRecordingWorkflow`、`chromeInstallGate`、`browserApi`、`useBrowserSessionState` 的导入与调用（≈L39-47、≈L67、≈L335-347、≈L568-572）；删除 `canTerminal`（≈L121）与录制状态（≈L123-124）、Chrome 安装提示 effect（≈L376-405）、`onAutoRecordingStarted`（≈L559）、`recordReplayStatus` effect（≈L757-772）、`handleAcpPermissionSelect` 及其透传（≈L727-732、≈L1178）、`onOpenBrowser`（≈L1181-1183）、终端悬浮按钮（≈L1276-1290）、浏览器状态徽标（≈L1322 起）与 `browserEnvironment`（≈L1443）；从 `interceptUserMessage` 的下游删去对录制工作流的调用。`pages/Chat/hooks/useChatSend.ts`：删除 `onAutoRecordingStarted` 选项（≈L46-47、≈L84）与 `autoRecord` 分支（≈L247-293）。
+  - 改动：删除 `pages/Chat/hooks/useBrowserToolDetection.ts`、`pages/Chat/hooks/useSkillRecordingWorkflow.ts`、`pages/Chat/utils/chromeInstallGate.ts` 与 `chromeInstallGate.test.ts`。**不删** `pages/Chat/chatBrowserPanel.partial.less` 及其 `@import`；**不改** design.md"删除边界"列出的被动渲染分支。
+  - 验证：`cd dashboard && npx tsc -b && npm run lint && npx vitest run src/pages/Chat src/components/ChatDockPanelShell`
+  - 验证：`! rg -n 'api/modules/browser|browserApi|useBrowserSessionState|toggleTerminalPanel|Control/Terminal|kind: "browser"|kind: "terminal"' dashboard/src/pages/Chat`
+  - _需求：10.3, 10.4, 10.5_
+
+- [ ] 16. 前端：删除页面、组件、hooks、API 模块与路由入口（1.25 人日）
+  - [ ] 16.1 先改测试
+    - 改动：`dashboard/src/routes/controlAdminPath.test.ts`：删除 workbench 与 remote-desktop / acp 两个 `it` 块（≈L11-35），以及 `canAccessPath` 中涉及已删路径的断言（≈L83-95）；新增断言：`pathPermissionKeys("/workbench")` 与 `pathPermissionKeys("/acp")` 为 `null`，`routeConfigs` 中没有需求 10.2 列出的路径。`dashboard/src/layouts/sidebarNav.test.ts`：≈L26 改为 `buildNavSections(adminUser)`，新增"不存在 `groupKey === "nav.control"` 的分组"。
+    - 验证：`cd dashboard && npx vitest run src/routes src/layouts`（此时应失败）
+    - _需求：10.2, 11.3_
+  - [ ] 16.2 删除文件
+    - 改动：删除目录 `dashboard/src/pages/Control/{Terminal,RemoteBrowser,RemoteDesktop,RemoteAndroid,Workbench}/`、`dashboard/src/pages/Agent/ACP/`、`dashboard/src/components/{BrowserViewer,ChromeTabBar}/`，以及 `dashboard/src/components/BrowserWorkspace/` 中剩余的 `index.tsx`、`index.module.less`、`ChatBrowserPanel.tsx`；删除 `dashboard/src/components/{BrowserAiPanel.tsx,BrowserAiPanel.module.less,MobileAiPanel.tsx,SkillRecordGuideModal.tsx}`。`pages/Control/CronJobs/` 与 `pages/Control/TokenUsage/` 保留。
+    - 改动：删除 `dashboard/src/hooks/` 下的 `useAgentThreadChat.ts`、`useAutoViewportResize.ts`、`useBrowserCanvasInteraction.ts` 与 `.test.ts`、`useBrowserSessionState.ts`、`useBrowserStream.ts`、`useBrowserViewController.ts`、`useCanvasRemotePointer.ts` 与 `.test.ts`、`useDesktopCanvasInteraction.ts`、`useDesktopInstall.ts`、`useDesktopStream.ts`、`useMobileStream.ts`、`useRemoteBrowserBookmarks.ts`、`useTerminalAutopilot.ts`、`useViewportMode.ts`；删除 `dashboard/src/utils/` 下的 `browserCanvas.ts`、`browserTabs.ts`、`__tests__/browserTabs.test.ts`、`browserProfile.ts`、`browserViewport.ts`、`desktopViewport.ts`。`useServiceRestart.ts`、`useDesktopChrome.ts`、`useIsMobile.ts`、`desktopChrome.ts`、`mobileDevice.ts`、`browserSpeech.ts`、`parseAcpPermission.ts` 保留。
+    - 改动：删除 `dashboard/src/api/modules/{browser,desktop,mobile,acp,terminalAi}.ts` 与 `dashboard/src/api/types/{browser,acp}.ts`；`dashboard/src/api/index.ts` 删除 `acpApi`、`browserApi`、`terminalAiApi` 的导入（≈L27、≈L29、≈L31）与展开（≈L50、≈L80、≈L86）；`dashboard/src/api/types/index.ts` 删除 `export * from "./browser";`（≈L10）。
+    - _需求：10.1_
+  - [ ] 16.3 路由、布局、导航与权限真值表
+    - 改动：`dashboard/src/routes/index.tsx`：删除 `ACPPage` 与 `RemoteDesktopPage` 懒加载（≈L13、≈L17）；从 `pathToKey` 删去 ≈L68 与 ≈L70-81；`FULLSCREEN_PATHS`（≈L98-109）只保留 `"/chat"`；删除 `isWorkbenchPath` 与 `isRemoteDesktopPath`（≈L119-127）；从 `resolveSelectedKey` 删去 ≈L138-139；从 `routeConfigs` 删去 `/personalization/acp`、`/acp`、`/workbench{,/terminal,/browser}`、`/terminal`、`/remote-browser`、`/remote-desktop{,/desktop,/phone,/phone/screen,/phone/shell}`、`/remote-phone`、`/remote-android` 共 14 条（≈L157-196）。`dashboard/src/routes/prefetch.ts` 删去 ≈L12-20 与 ≈L24。
+    - 改动：`dashboard/src/layouts/MainLayout/index.tsx`：删除 `isWorkbenchPath` 导入（≈L18）、`WorkbenchPage`（≈L30）、`onWorkbench` 与 `workbenchMounted` 及其 effect（≈L67-77）、keep-alive 块（≈L293-310），把 ≈L318 的 `display` 固定为 `"flex"`。
+    - 改动：`dashboard/src/layouts/sidebarNav.tsx`：`SIDEBAR_GROUPED_NAV_KEYS` 删去 `"workbench"`、`"remote-desktop"`、`"acp"`（≈L56-58）；删除 `controlItems` 整块及 `nav.control` 分组的 push（≈L153-185）；`buildNavSections` 去掉 `opts` 形参（≈L76）；删除 `Monitor`、`Share2`、`PanelsTopLeft` 三个图标导入（≈L3、≈L13、≈L20）。`dashboard/src/layouts/Sidebar.tsx`：两处改为 `buildNavSections(user)`（≈L266、≈L389），删除 `useServerCapabilities` 的导入与调用（≈L15、≈L265、≈L385）。
+    - 改动：`dashboard/src/utils/permissions.ts`：`PERM` 删去 `workbench`、`browser`、`terminal`、`desktop`、`mobile`（≈L18-22）；`NAV_PERMISSIONS` 删去 `workbench`、`"remote-desktop"`、`"remote-phone"`、`acp`（≈L37-40）；`pathPermissionKeys` 删去 ≈L183-213 的分支（含 ACP 注释行）；`routeNeedsPermission` 删去 workbench 分支（≈L224）。
+    - 改动：`dashboard/src/pages/Agent/Tools/ToolsTabs.tsx`：删除 `ACPPanel` 导入（≈L13）、`Share2` 图标、`acp` tab 定义与 `canAcp` 逻辑，`ToolsTab` 改为 `"builtin" | "plugin"`，更新 ≈L1-6 的注释。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test && npm run build`
+    - 验证：`for p in src/pages/Control/Terminal src/pages/Control/RemoteBrowser src/pages/Control/RemoteDesktop src/pages/Control/RemoteAndroid src/pages/Control/Workbench src/pages/Agent/ACP src/components/BrowserViewer src/components/ChromeTabBar src/components/BrowserWorkspace src/api/modules/browser.ts src/api/modules/desktop.ts src/api/modules/mobile.ts src/api/modules/acp.ts src/api/modules/terminalAi.ts; do test ! -e "dashboard/$p" || echo "still exists: $p"; done`（无输出）
+    - 验证：`! rg -n 'mobileEnabled|workbench|remote-desktop|remote-phone|PERM\.(workbench|browser|terminal|desktop|mobile)' dashboard/src/layouts dashboard/src/utils/permissions.ts`
+    - 验证：`test -f dashboard/src/hooks/useServiceRestart.ts && test -f dashboard/src/utils/mobileDevice.ts && test -f dashboard/src/utils/browserSpeech.ts`
+    - _需求：10.1, 10.2, 10.5, 11.3_
+
+- [ ] 17. 前端：能力开关 hook 泛化（测试先行，0.5 人日）
+  - 改动：先写 `dashboard/src/hooks/useServerCapabilities.test.ts`：mock `octopSettingsApi.capabilities`。同时挂载两个使用该 hook 的组件时，只发起一次调用；成功时 `caps` 等于响应的 `capabilities`，`loading` 变为 `false`；请求失败时 `caps` 为 `{}`、`loading=false` 且没有未捕获异常；`isCapabilityEnabled({ a: { enabled: true } }, "a")` 为 `true`，缺失名为 `false`。
+  - 改动：`dashboard/src/api/modules/settings.ts`：`OctopCapabilitiesSettings` 改为 `{ capabilities: Record<string, { enabled: boolean }> }`（≈L12-14），保留 `cache: "no-store"`。`dashboard/src/hooks/useServerCapabilities.ts`：保留 `inFlight` 合并，删除 `loadMobileEnabled` 与 `mobileEnabled`，导出 `useServerCapabilities(): { caps, loading }` 与 `isCapabilityEnabled`。
+  - 验证：`cd dashboard && npx tsc -b && npx vitest run src/hooks/useServerCapabilities.test.ts && npm run lint`
+  - 验证：`! rg -n 'mobileEnabled|data\.mobile' dashboard/src`
+  - _需求：11.1, 11.2, 11.3_
+
+- [ ] 18. 依赖与构建清理，重生成锁文件（0.5 人日）
+  - 改动：`pyproject.toml`：删除 `playwright>=1.40` 直接依赖（≈L37）、`browser` extra 及其注释（≈L65-68）、hatch include 中的 `"src/octop/infra/desktop/scripts/**/*"`（≈L114）。`harness-browser>=0.7.9`（≈L36，`browser_media.py` 仍在使用）、`desktop` extra（≈L70，`fnos/docker/Dockerfile` 仍在引用）、`orcakit-harness-agent[all]`（≈L24）都不动。
+  - 改动：`docker/Dockerfile`：两处 `uv sync ... --extra browser`（≈L110、≈L127）去掉 `--extra browser`；从 ≈L112-113 的 `ENV` 中删去 `PLAYWRIGHT_BROWSERS_PATH`。
+  - 改动：`dashboard/package.json`：删除 `@xterm/addon-fit`、`@xterm/addon-web-links`、`@xterm/xterm`（≈L26-28）。`dashboard/vite.config.ts` 中 `@xterm` 的分包规则与 mangle 注释保留（不再命中，无害）。
+  - 改动：执行 `make relock` 重生成 `uv.lock` 与 `dashboard/package-lock.json`，作为本任务最后一个 commit 单独提交。
+  - 验证：`uv lock --check && ! rg -n '^name = "playwright"$' uv.lock && ! rg -n 'playwright|infra/desktop/scripts' pyproject.toml`
+  - 验证：`! rg -n 'extra browser|PLAYWRIGHT_BROWSERS_PATH' docker/Dockerfile && ! rg -n '@xterm/' dashboard/package.json dashboard/package-lock.json`
+  - 验证：`make install-frontend && cd dashboard && npm run build`
+  - 验证：`make all`
+  - _需求：12.1, 12.2, 12.3_
+
+- [ ] 19. fork 文档：能力开关说明、AGENTS.md 与 `docs/acp.md`（0.5 人日）
+  - 改动：新增 `docs/intranet/capabilities.md`，包括：`capabilities` 段形状与示例；`OCTOP_CAPABILITY_<NAME>` 规则；当前目录（空）与保留名及 owner 表；legacy `mobile` 键的处理；fail-closed 规则与典型报错；关闭后 404 的语义；强制工具禁用的三层与"子代理只覆盖已删工具"的已知限制；"新增一个能力"清单（`capability_catalog.py` 登记 → 路由登记 `FORK_CAPABILITY_MOUNTS` 或用 `require_capability` → 中间件登记 `FORK_AGENT_MIDDLEWARE` → 前端 `isCapabilityEnabled` → `docs/api-intranet.md` 与本文档）；上游同步时对已删文件的冲突一律保持删除。
+  - 改动：`AGENTS.md`：§5 `infra/agents/` 一行删去 `acp_settings`（≈L110）；删除 `api/routers/browser/` 一行（≈L140）；CLI Embedded 示例删去 `` `acp` ``（≈L162）；§7 Key patterns 增加一条，指向 `docs/intranet/capabilities.md`、`infra/capabilities.py::forced_disabled_tools` 与 `infra/agents/middleware_registry.py`，并说明"新增 agent 中间件只登记、不改 `manager.py` 的列表"。
+  - 改动：删除 `docs/acp.md`。上游文档中的 7 处链接不改，在 `docs/intranet/capabilities.md` 中登记。
+  - 验证：`! rg -n 'acp_settings|routers/browser/|.acp. \|' AGENTS.md && test ! -e docs/acp.md && test -f docs/intranet/capabilities.md`
+  - 验证：`uv run pytest tests/unit/test_fork_isolation_contract.py -q`（w0-04 的契约测试不受影响）
+  - _需求：14.2, 14.3, 1.4_
+
+- [ ] 20. 手工冒烟与回归修复（1.0 人日）
+  - 改动：只修复冒烟中发现的问题。启动 `uv run octop run` 后逐项验证：
+    - 聊天页 dock 的 files、file、knowledge、toolUi 四类 tab，在 popup、right、bottom 三种模式间切换，关闭再打开后状态保持；
+    - agent 工具设置页只剩"内置、插件"两个 tab，列表中没有已删工具；
+    - 安全策略页的 HITL 工具选择器中没有 `browser_use` 与 `desktop_screenshot`；
+    - HTTPS 设置页的重启流程（`useServiceRestart`）；
+    - 通道配置页可以打开；
+    - 用含 `"capabilities": {"mobile": {"enabled": true, "backend": "redroid"}}` 的旧 `config.json` 启动，日志中有 WARNING，服务正常启动；
+    - 旧用户（`permissions` 含 `browser`）升级后可以正常编辑；
+    - 访问 `/workbench`、`/acp` 落到 NotFound 页；
+    - 至少一个 agent 能完成一轮对话。
+  - 验证：`uv run pytest tests/integration -q`
+  - 验证：`make check-frontend`
+  - _需求：3.3, 6.3, 10.2, 10.3, 10.5, 5.1_
+
+- [ ] 21. 收尾：全量门禁与 fork 变更记录（1.0 人日）
+  - 改动：`CHANGELOG-intranet.md` 的 `## [Unreleased]` 下追加以 `w1-02-capability-trim` 开头的条目，分四类：
+    - "移除"：五类能力、4 个权限键、`octop acp`、`OCTOP_ENABLE_MOBILE`、playwright、`@xterm/*`、`docker-compose.mobile.yml`、`docs/acp.md`；
+    - "新增"：能力开关框架、`OCTOP_CAPABILITY_*`、`forced_disabled_tools`、中间件注册表、配置三触点门禁；
+    - "变更"：`GET /api/settings/capabilities` 的响应形状；`capabilities` 段 schema，legacy `mobile` 被忽略；
+    - "安全"：强制禁用三层；fork 迁移清除 `acp_runners:user:*` 与已删权限键残值。
+  - 改动：`docs/api-intranet.md`：
+    - "已物理删除的上游路由"一节列出需求 1.1 的全部前缀与 `octop acp`；
+    - "fork 新增或变更的端点"一节写 `GET /api/settings/capabilities` 的新形状，以及 `PATCH /api/agents/{id}/tool-settings/{tool}` 对强制禁用工具返回 400；
+    - "鉴权与权限差异"一节列出删除的四个权限键；
+    - "fork 新增错误码"一节写"本 spec 无"。
+  - 验证：`make all`
+  - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test`（或 `make check-frontend`）
+  - 验证：`git diff --stat w1-02-base -- src/octop/i18n/en.json src/octop/i18n/zh.json dashboard/src/locales/en.json dashboard/src/locales/zh.json CHANGELOG.md docs/api.md src/octop/infra/errors.py`（输出为空）
+  - 验证：`uv run pytest tests/unit/i18n -q`
+  - 验证：`! rg -n 'user_browser_profile|parse_octop_user_id|harness_settings_for_screenshots_dir|BrowserProfileMiddleware|ACPSettingsStore|mobile_tools|\.capabilities\.mobile' src && ! rg -n 'octop\.infra\.(browser|desktop|mobile)|routers\.(terminal|acp)\b|acp_settings|harness_agent\.acp|config_probe' src`
+  - 验证：`rg -n 'w1-02-capability-trim' CHANGELOG-intranet.md && rg -n '/api/browser-stream|/api/mobile-stream|/api/desktop-stream' docs/api-intranet.md`
+  - _需求：13.1, 13.2, 13.3, 13.4, 14.1, 2.3, 1.4_

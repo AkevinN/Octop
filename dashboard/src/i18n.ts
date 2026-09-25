@@ -2,6 +2,7 @@ import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 import { getApiUrl } from "./api/config";
 import { i18nApi } from "./api/modules/i18n";
+import { applyIntranetOverlay } from "./i18nIntranet";
 import {
   resolveInitialLocale,
   syncDocumentLang,
@@ -21,6 +22,7 @@ export async function ensureLocaleBundle(locale: UiLocale): Promise<void> {
   if (!i18n.hasResourceBundle(locale, "translation")) {
     const bundle = await loadLocaleBundle(locale);
     i18n.addResourceBundle(locale, "translation", bundle, true, true);
+    applyIntranetOverlay(locale);
   }
 }
 
@@ -99,6 +101,7 @@ export function initI18n(): Promise<void> {
           escapeValue: false,
         },
       });
+      applyIntranetOverlay(initial);
 
       syncDocumentLang(initial);
 

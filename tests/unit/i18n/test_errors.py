@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import re
-from pathlib import Path
 
 import pytest
+from tests.support.i18n_bundles import merged_backend_bundle, merged_dashboard_bundle
 
 from octop.i18n import error_message
 from octop.infra.errors import ErrorCode, OctopError
@@ -50,9 +49,8 @@ def test_resolve_request_locale_from_accept_language():
 
 
 def test_dashboard_api_errors_match_backend():
-    repo = Path(__file__).resolve().parents[3]
-    dash_en = json.loads((repo / "dashboard/src/locales/en.json").read_text(encoding="utf-8"))
-    backend_en = json.loads((repo / "src/octop/i18n/en.json").read_text(encoding="utf-8"))
+    dash_en = merged_dashboard_bundle("en")
+    backend_en = merged_backend_bundle("en")
     dash_codes = set(dash_en["apiErrors"].keys())
     backend_codes = set(backend_en["errors"].keys())
     assert dash_codes == backend_codes == {c.value for c in ErrorCode}
@@ -63,12 +61,8 @@ _DASHBOARD_SINGLE_BRACE = re.compile(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}(?!\})
 
 
 def test_dashboard_api_errors_use_i18next_placeholders():
-    repo = Path(__file__).resolve().parents[3]
     for locale in ("en", "zh"):
-        data = json.loads(
-            (repo / f"dashboard/src/locales/{locale}.json").read_text(encoding="utf-8")
-        )
-        for code, msg in data["apiErrors"].items():
+        for code, msg in merged_dashboard_bundle(locale)["apiErrors"].items():
             found = _DASHBOARD_SINGLE_BRACE.findall(msg)
             assert not found, (
                 f"{locale} apiErrors.{code} uses Python-style {{{', '.join(found)}}} — "

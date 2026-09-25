@@ -12,14 +12,27 @@ import httpx
 from httpcore._backends.auto import AutoBackend
 from httpcore._backends.base import SOCKET_OPTION, AsyncNetworkStream
 
+from octop.infra.utils.intranet_allowlist import IntranetAllowlist, current_intranet_allowlist
+
 
 class UnsafeOutboundUrl(ValueError):
     """Raised when a URL must not be fetched server-side."""
 
 
+def intranet_http_allowed(url: str) -> bool:
+    """True when plain-http ``url`` targets an allowlisted host and http is enabled."""
+    allow = current_intranet_allowlist()
+    parsed = urlparse(url)
+    return (
+        parsed.scheme == "http"
+        and allow.allow_http
+        and allow.trusts_host((parsed.hostname or "").rstrip("."))
+    )
+
+
 def _parse_https_host(url: str) -> tuple[str, int | None]:
     parsed = urlparse(url)
-    if parsed.scheme != "https":
+    if parsed.scheme != "https" and not intranet_http_allowed(url):
         raise UnsafeOutboundUrl("only https URLs are allowed")
     host = parsed.hostname
     if not host:
@@ -27,7 +40,7 @@ def _parse_https_host(url: str) -> tuple[str, int | None]:
     return host.lower().rstrip("."), parsed.port
 
 
-def _check_ip_not_private(ip_str: str) -> None:
+def _check_ip_not_private(ip_str: str, allow: IntranetAllowlist | None = None) -> None:
     addr = ipaddress.ip_address(ip_str)
     if (
         addr.is_private
@@ -35,7 +48,7 @@ def _check_ip_not_private(ip_str: str) -> None:
         or addr.is_link_local
         or addr.is_reserved
         or addr.is_multicast
-    ):
+    ) and not (allow is not None and allow.permits_ip(addr)):
         raise UnsafeOutboundUrl("private or reserved IP addresses are not allowed")
 
 
@@ -44,11 +57,11 @@ def _check_ip_literal(host: str) -> None:
         ipaddress.ip_address(host)
     except ValueError:
         return
-    _check_ip_not_private(host)
+    _check_ip_not_private(host, current_intranet_allowlist())
 
 
-def _check_resolved_ip(ip_str: str) -> None:
-    _check_ip_not_private(ip_str)
+def _check_resolved_ip(ip_str: str, allow: IntranetAllowlist | None = None) -> None:
+    _check_ip_not_private(ip_str, allow)
 
 
 def issuer_base_domain(issuer: str) -> str:
@@ -69,7 +82,7 @@ def host_allowed_for_issuer(host: str, issuer: str) -> bool:
 
 
 def validate_https_url(url: str, *, field: str = "url") -> str:
-    """Reject non-https URLs and literal private/reserved IPs."""
+    """Reject non-https URLs and literal private/reserved IPs, bar the intranet allowlist."""
     host, _ = _parse_https_host(url)
     if host == "localhost":
         raise UnsafeOutboundUrl(f"{field}: localhost is not allowed")
@@ -89,14 +102,18 @@ async def _resolve_validated_ip(url: str) -> str:
 
     Raises :class:`UnsafeOutboundUrl` if the host cannot be resolved or any
     resolved address is private/reserved.  The caller should pin the returned
-    IP for the actual connection to defeat DNS-rebinding (TOCTOU).
+    IP for the actual connection to defeat DNS-rebinding (TOCTOU).  Intranet
+    addresses pass only for a host matching an allowlisted suffix (or an
+    allowlisted literal); plain http needs every address inside the allowlist.
     """
     host, port = _parse_https_host(url)
+    allow = current_intranet_allowlist()
+    plaintext = urlparse(url).scheme == "http"  # only if intranet_http_allowed()
     loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(
             host,
-            port or 443,
+            port or (80 if plaintext else 443),
             type=socket.SOCK_STREAM,
             proto=socket.IPPROTO_TCP,
         )
@@ -104,8 +121,11 @@ async def _resolve_validated_ip(url: str) -> str:
         raise UnsafeOutboundUrl(f"cannot resolve hostname {host!r}") from exc
     if not infos:
         raise UnsafeOutboundUrl(f"cannot resolve hostname {host!r}")
+    trusted = allow if allow.trusts_host(host) else None
     for info in infos:
-        _check_resolved_ip(info[4][0])
+        if plaintext and not allow.permits_ip(ipaddress.ip_address(info[4][0])):
+            raise UnsafeOutboundUrl("only https URLs are allowed")
+        _check_resolved_ip(info[4][0], trusted)
     return infos[0][4][0]
 
 
@@ -174,9 +194,10 @@ async def safe_request(
     """Validate, resolve, pin the IP, and perform an outbound HTTPS request.
 
     URL scheme/host must be https and resolve to a public IP (see
-    :func:`validate_https_url_resolved`).  The connection is then pinned to the
-    validated IP so a malicious DNS change between validation and connection
-    cannot redirect the request to an internal address.
+    :func:`validate_https_url_resolved`), unless the intranet allowlist admits
+    it.  The connection is then pinned to the validated IP so a malicious DNS
+    change between validation and connection cannot redirect the request to an
+    internal address.
     """
     host, _port = _parse_https_host(url)
     pin_ip = await _resolve_validated_ip(url)

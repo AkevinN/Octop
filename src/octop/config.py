@@ -143,6 +143,10 @@ class OctopConfig:
     capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
     max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
     browser_idle_timeout_minutes: int = DEFAULT_BROWSER_IDLE_TIMEOUT_MINUTES
+    # SSRF-guard intranet allowlist (infra/utils/intranet_allowlist.py); empty = upstream.
+    intranet_allow_cidrs: list[str] = field(default_factory=list)
+    intranet_allow_host_suffixes: list[str] = field(default_factory=list)
+    intranet_allow_http: bool = False
 
     @property
     def max_upload_bytes(self) -> int:
@@ -290,6 +294,20 @@ def _coerce_bool(name: str, value: str, default: bool) -> bool:
     # sensitive by CodeQL (py/clear-text-logging-sensitive-data).
     logger.warning("env %s is not bool; using %s", name, default)
     return default
+
+
+def _str_list_key(merged: dict[str, Any], key: str) -> list[str]:
+    value = merged[key]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"config.{key} must be a list of strings")
+    return list(value)
+
+
+def _bool_key(merged: dict[str, Any], key: str) -> bool:
+    value = merged[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"config.{key} must be true or false")
+    return value
 
 
 def _parse_database_url(url: str) -> dict[str, Any]:
@@ -507,6 +525,14 @@ def load_config(path: Path) -> OctopConfig:
                 )
             ),
         )
+    if v := os.environ.get("OCTOP_INTRANET_ALLOW_CIDRS"):
+        merged["intranet_allow_cidrs"] = [s.strip() for s in v.split(",") if s.strip()]
+    if v := os.environ.get("OCTOP_INTRANET_ALLOW_HOST_SUFFIXES"):
+        merged["intranet_allow_host_suffixes"] = [s.strip() for s in v.split(",") if s.strip()]
+    if v := os.environ.get("OCTOP_INTRANET_ALLOW_HTTP"):
+        merged["intranet_allow_http"] = _coerce_bool(
+            "OCTOP_INTRANET_ALLOW_HTTP", v, merged["intranet_allow_http"] is True
+        )
 
     capabilities = _parse_capabilities_section(raw.get("capabilities"))
     if v := os.environ.get("OCTOP_ENABLE_MOBILE"):
@@ -623,4 +649,7 @@ def load_config(path: Path) -> OctopConfig:
                 )
             ),
         ),
+        intranet_allow_cidrs=_str_list_key(merged, "intranet_allow_cidrs"),
+        intranet_allow_host_suffixes=_str_list_key(merged, "intranet_allow_host_suffixes"),
+        intranet_allow_http=_bool_key(merged, "intranet_allow_http"),
     )

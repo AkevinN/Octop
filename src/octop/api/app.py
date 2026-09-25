@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from scalar_fastapi import get_scalar_api_reference
 
+from octop.api.intranet_mounts import without_fork_disabled
 from octop.api.middleware.jwt_auth import install as install_jwt_auth
 from octop.api.middleware.setup_lockdown import install as install_setup_lockdown
 from octop.api.openapi_meta import API_DESCRIPTION, OPENAPI_TAGS, configure_openapi
@@ -70,7 +71,7 @@ def _dashboard_fallback(index_file: Path, full_path: str) -> FileResponse:
 
 
 def _mount_routers(app: FastAPI, mounts: Sequence[_RouterMount]) -> None:
-    for spec in mounts:
+    for spec in without_fork_disabled(mounts):
         app.include_router(spec.router, prefix=spec.prefix, tags=list(spec.tags))
 
 

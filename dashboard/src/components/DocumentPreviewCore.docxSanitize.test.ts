@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { clampAbsurdDocxCssLengths } from "./DocumentPreviewCore";
+
+vi.mock("react-pdf", () => ({ pdfjs: { GlobalWorkerOptions: {} } }));
 
 describe("clampAbsurdDocxCssLengths", () => {
   it("zeros out overflow-scale min-height / line-height from corrupt DOCX spacing", () => {

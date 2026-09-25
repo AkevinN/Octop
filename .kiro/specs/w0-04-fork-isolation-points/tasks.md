@@ -1,0 +1,192 @@
+# 实施计划：fork 隔离点与上游同步机制
+
+> spec：`w0-04-fork-isolation-points` ｜ 波次：Wave 0 ｜ 基线：`757fd12` ｜ 预估：5 人日
+> 前置：`w0-02-ci-gates`、`w0-01-fork-migration-namespace` ｜ 全局约束：`.kiro/steering/intranet-transformation.md`
+
+每个顶层任务完成后可独立提交；提交前运行任务内的验证命令。
+
+前端命令需要 `dashboard/node_modules`：先执行一次 `make install-frontend`（`w0-02` 提供，可带 `NPM_REGISTRY=…`）。
+
+- [x] 1. 确认前置 spec 已合入并记录基线（0.25 人日）
+  - 改动：无代码改动。需要确认以下几点，并把各命令的输出贴进 PR 描述作为基线记录：
+    - 工作分支包含 `757fd12`；
+    - `w0-02` 已交付 `Makefile.intranet`、根 `Makefile` 的 `include` 行与 `check-frontend`；
+    - `w0-01` 已交付 `fork_migrate.py`；
+    - 记录当前 i18n 用例数、连接器目录条数；
+    - 记录 `CHANGELOG-intranet.md` 是否已存在、有哪些条目。
+  - 验证：`git merge-base --is-ancestor 757fd12 HEAD && echo baseline-ok`
+  - 验证：`test -f Makefile.intranet && rg -n '^include Makefile.intranet' Makefile && rg -n '^(help-intranet|install-frontend|check-frontend):' Makefile.intranet`
+  - 验证：`test -f src/octop/infra/db/fork_migrate.py && echo w0-01-ok`
+  - 验证：`uv run pytest tests/unit/i18n -q`（基线为 69 passed，记录实际数字）
+  - 验证：`uv run python -c "from octop.infra.connectors.catalog import list_catalog; print(len(list_catalog()))"`（期望 `23`）
+  - 验证：`test -e CHANGELOG-intranet.md && rg -n '^#|w0-0' CHANGELOG-intranet.md || echo no-changelog-yet`
+  - _需求：1.4, 5.4_
+
+- [x] 2. 后端 i18n overlay（测试先行，0.5 人日）
+  - [x] 2.1 先写会失败的测试
+    - 改动：新增 `tests/unit/i18n/test_intranet_overlay.py`，先写后端部分：
+      - `deep_merge`：两边都是对象时递归合并；叶子被覆盖；上游兄弟键保留；overlay 新增的子树被加入；调用前后对两个入参做 `copy.deepcopy` 比较，确认它们未被修改。
+      - 探针 fixture：`_load_all.cache_clear()`，再把 `octop.i18n.overlay._OVERLAY_ROOT` monkeypatch 到 `tmp_path` 并写入 en、zh 两份文件，内容为 `{"slash": {"help": {"title": "<探针>"}}, "tools": {"intranet_probe_tool": "<探针>"}, "skills": {"intranet-probe": "<探针>"}, "intranet_probe": {"k": "<探针>"}}`（en 与 zh 各一份）；teardown 时再调用一次 `cache_clear()`。在探针下断言：`tr("slash.help.title", …)`、`lookup("intranet_probe.k", …)` 取到探针值；`"intranet_probe.k" in all_keys_for_locale("en")`；`all_tool_labels("zh")["intranet_probe_tool"]` 与 `all_skill_labels("en")["intranet-probe"]` 取到探针值；`tr("slash.error.unknown_command", "en", name="x")` 仍是上游值。
+      - 异常：同一 fixture 下分别构造缺失文件、`{bad json`、`[]` 三种情形，断言首次 `_load_all()` 依次抛出 `FileNotFoundError`、`json.JSONDecodeError`、`ValueError`。
+      - （实施：不单写打包 `is_file()` 用例；overlay 缺失时全部 i18n 用例都会失败，wheel 内容由 2.2 的 `uv build` 命令核对。）
+      - 后端 overlay 的 en == zh：`flatten_keys(read_overlay("en")) == flatten_keys(read_overlay("zh"))`，失败信息列出对称差。
+      - 后端 overlay 的形状：对每个 locale，overlay 中每个与上游重叠的路径，两边类型（`str` 或 `dict`）必须一致，失败信息列出冲突路径。
+    - 改动（实施：并入上面的探针用例，用裸 `FastAPI` 挂 `octop.api.routers.i18n.router`，不新增集成文件）：带 `Accept-Language: zh`，断言 `GET /api/i18n/tools` 返回的 `labels["intranet_probe_tool"]` 与 `GET /api/i18n/skills` 返回的 `labels["intranet-probe"]` 都是探针值。
+    - 验证：`uv run pytest tests/unit/i18n/test_intranet_overlay.py -q`（期望失败，原因是 `ModuleNotFoundError: No module named 'octop.i18n.overlay'`）
+    - _需求：1.1, 1.2, 1.3, 1.5, 3.3, 3.4, 3.5_
+  - [x] 2.2 实现 overlay 并接入 loader
+    - 改动：新增 `src/octop/i18n/overlay.py`，内容为 `_OVERLAY_ROOT`、`deep_merge`、`read_overlay`（签名与 docstring 见 design.md）。
+    - 改动：新增 `src/octop/i18n/intranet/en.json` 与 `src/octop/i18n/intranet/zh.json`，内容都是 `{}` 加换行。
+    - 改动：`src/octop/i18n/loader.py` 增加一行 `from octop.i18n.overlay import deep_merge, read_overlay`；`_load_all` 循环体中 `out[loc] = json.loads(raw)` 改为 `out[loc] = deep_merge(json.loads(raw), read_overlay(loc))`。其余不动。
+    - 验证：`uv run pytest tests/unit/i18n -q`（期望全部通过，基线的 69 个用例都在其中）
+    - 验证：`git diff --numstat 757fd12 -- src/octop/i18n/loader.py`（期望 `2	1`）
+    - 验证：`uv run ruff check src/octop/i18n && uv run mypy src/octop/i18n`
+    - 验证：`d=$(mktemp -d) && uv build --wheel -o "$d" && uv run python -c "import sys,glob,zipfile; n=set(zipfile.ZipFile(glob.glob(sys.argv[1]+'/*.whl')[0]).namelist()); assert {'octop/i18n/intranet/en.json','octop/i18n/intranet/zh.json'} <= n; print('wheel-ok')" "$d"`
+    - _需求：1.1, 1.2, 1.3, 1.4, 1.5, 3.3, 10.3_
+
+- [x] 3. i18n 门禁改读合并后的 bundle，dashboard overlay 对等（测试先行，0.5 人日）
+  - [x] 3.1 先写辅助函数与会失败的测试
+    - 改动：新增 `tests/support/i18n_bundles.py`，提供 `REPO_ROOT`、`DASHBOARD_LOCALES`、`DASHBOARD_OVERLAY_DIR`、`read_json`、`merged_backend_bundle`、`merged_dashboard_bundle`（见 design.md；叶子键集复用 `octop.i18n.loader.flatten_keys`，形状检查是 `test_intranet_overlay.py` 内的私有函数）。`merged_dashboard_bundle` 用 `octop.i18n.overlay.deep_merge` 合并，路径全部用 `pathlib` 拼接，文本读取指定 `encoding="utf-8"`。
+    - 改动：在 `tests/unit/i18n/test_intranet_overlay.py` 中追加 dashboard 部分：
+      - dashboard overlay 的 en == zh 叶子键集；
+      - dashboard overlay 与上游 dashboard locale 的形状冲突；
+      - 探针：monkeypatch `tests.support.i18n_bundles.DASHBOARD_OVERLAY_DIR` 指向 `tmp_path`，在其中写入 `{"common": {"save": "X"}}`，断言 `merged_dashboard_bundle("en")["common"]["save"] == "X"`，且 `["common"]["reset"]` 仍是上游值。
+    - 验证：`uv run pytest tests/unit/i18n/test_intranet_overlay.py -q`（期望 dashboard 部分失败，原因是 `dashboard/src/locales/intranet/en.json` 不存在）
+    - _需求：3.4, 3.5_
+  - [x] 3.2 建 dashboard overlay 文件，三条门禁改读合并结果
+    - 改动：新增 `dashboard/src/locales/intranet/en.json` 与 `dashboard/src/locales/intranet/zh.json`，内容都是 `{}` 加换行（符合 Prettier 格式）。
+    - 改动：`tests/unit/i18n/test_errors.py`：
+      - `test_dashboard_api_errors_match_backend` 的两行 `json.loads(...)` 换成 `merged_dashboard_bundle("en")` 与 `merged_backend_bundle("en")`，断言不变；
+      - `test_dashboard_api_errors_use_i18next_placeholders` 的循环体改读 `merged_dashboard_bundle(locale)["apiErrors"]`。
+    - 改动：`tests/unit/i18n/test_tools.py::test_dashboard_tools_match_backend` 与 `tests/unit/i18n/test_skills.py::test_dashboard_skill_labels_match_backend` 做同样的替换。删除因此不再使用的 `json` / `Path` 导入；`test_catalog.py` 不改。
+    - 验证：`uv run pytest tests/unit/i18n -q`（期望全部通过）
+    - 验证：`git diff --stat 757fd12 -- src/octop/i18n/en.json src/octop/i18n/zh.json dashboard/src/locales/en.json dashboard/src/locales/zh.json`（期望无输出）
+    - 验证：`cd dashboard && npx prettier --check src/locales/intranet`
+    - 验证（负向，验证后撤销）：临时在 `dashboard/src/locales/intranet/en.json` 中写入 `{"apiErrors": {"NOT_A_CODE": "x"}}`，执行 `uv run pytest tests/unit/i18n -q`，期望 `test_dashboard_api_errors_match_backend` 与 dashboard overlay 对等用例都失败；再执行 `git checkout -- dashboard/src/locales/intranet/en.json` 撤销。
+    - _需求：3.1, 3.2, 3.4, 3.6_
+
+- [x] 4. 前端 i18n overlay（测试先行，0.5 人日）
+  - [x] 4.1 先写会失败的 vitest 用例与契约测试
+    - 改动：新增 `dashboard/src/i18nIntranet.test.ts`：
+      - 用 `vi.mock("./locales/intranet/en.json", …)` 与 `vi.mock("./locales/intranet/zh.json", …)` 返回 `{ default: { common: { save: "<探针>" }, intranetProbe: { hello: "<探针>" } } }`（en、zh 各用不同的值）；
+      - 用 `vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")))` 屏蔽网络；
+      - `localStorage.setItem(UI_LOCALE_STORAGE_KEY, "en")` 后 `await initI18n()`，断言 `i18n.t("common.save")` 与 `i18n.t("intranetProbe.hello")` 为 en 探针值，`i18n.t("common.reset")` 为 `"Reset"`；
+      - 再 `await ensureLocaleBundle("zh")`，断言 `i18n.getResource("zh", "translation", "common.save")` 为 zh 探针值，`common.reset` 等于静态导入的 `./locales/zh.json` 中的上游值；
+      - 用 `vi.spyOn(i18n, "addResourceBundle")` 后第二次 `await ensureLocaleBundle("zh")`，断言调用次数为 0（已加载的语言不重复加载、不重复叠加）。
+    - 改动：新增 `tests/unit/test_fork_isolation_contract.py`，先写 `test_i18n_ts_applies_intranet_overlay`：以 `encoding="utf-8"` 读取 `dashboard/src/i18n.ts`，断言它含 `from "./i18nIntranet"`，且 `applyIntranetOverlay(` 至少出现 2 次。路径用 `Path(__file__).resolve().parents[2]` 拼接。
+    - 验证：`cd dashboard && npm run test -- src/i18nIntranet.test.ts`（期望失败，原因是找不到 `./i18nIntranet` 或探针断言不成立）
+    - 验证：`uv run pytest tests/unit/test_fork_isolation_contract.py -q`（期望失败）
+    - _需求：2.1, 2.2, 2.3, 10.1_
+  - [x] 4.2 实现
+    - 改动：新增 `dashboard/src/i18nIntranet.ts`，导出 `applyIntranetOverlay(locale: UiLocale): void`（代码见 design.md）。
+    - 改动：`dashboard/src/i18n.ts` 新增三行：
+      - 一行 `import { applyIntranetOverlay } from "./i18nIntranet";`；
+      - `ensureLocaleBundle` 的 if 块内、`i18n.addResourceBundle(...)` 之后加 `applyIntranetOverlay(locale);`；
+      - `initI18n` 中 `await i18n.use(initReactI18next).init({...});` 之后加 `applyIntranetOverlay(initial);`。
+      - 其余不动。
+    - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run format:check && npm run test -- src/i18nIntranet.test.ts`
+    - 验证：`uv run pytest tests/unit/test_fork_isolation_contract.py -q`
+    - 验证：`git diff --numstat 757fd12 -- dashboard/src/i18n.ts`（期望 `3	0`）
+    - _需求：2.1, 2.2, 2.3, 2.4, 10.1, 10.4_
+
+- [x] 5. 路由下线过滤 `_FORK_DISABLED_MOUNTS`（测试先行，0.5 人日）
+  - [x] 5.1 先写会失败的测试
+    - 改动：新增 `tests/unit/api/test_intranet_mounts.py`：
+      - `without_fork_disabled` 在空集下返回与输入同序、同对象的列表（用 `types.SimpleNamespace(router=object())` 构造输入）。
+      - （实施：`build_app(SimpleNamespace(services=None))` 构建，比较 `app.openapi()["paths"]`，下线与登记项有效性合成一个对 `_FORK_DISABLED_MOUNTS ∪ {search}` 参数化的用例，见 design.md 测试策略。）monkeypatch `octop.api.intranet_mounts._FORK_DISABLED_MOUNTS = frozenset({"octop.api.routers.search:router"})` 后，照 `tests/unit/api/test_openapi_meta.py` 的方式构建 app：用 `tmp_octop_home` fixture，`write_octop_config(tmp_octop_home, enable_api_docs=True, enable_dashboard=False)`，`OctopServer` 执行 `start` 与 `ensure_control_plane_bound`，再调用 `build_app`。断言 `/api/search/{provider_id}/test` 不在 `{r.path for r in app.routes}` 中，也不在 `TestClient(app).get("/api/openapi.json").json()["paths"]` 中；同时 `/api/auth/login` 仍在。
+      - 下列四种非法引用都让 `build_app` 抛异常，用 `pytest.raises((RuntimeError, ImportError, AttributeError))` 断言：`"octop.api.routers.search"`（缺冒号）、`"octop.api.routers.no_such:router"`、`"octop.api.routers.search:no_such"`、`"octop.api.app:build_app"`（不是 APIRouter）。
+      - 登记项有效性：对当前 `_FORK_DISABLED_MOUNTS` 的每一项，先把集合清空再构建 app，断言该 router 的每条路径（加上挂载前缀）出现在 `app.routes` 中。集合为空时该用例空转通过。
+    - 验证：`uv run pytest tests/unit/api/test_intranet_mounts.py -q`（期望失败，原因是 `ModuleNotFoundError: No module named 'octop.api.intranet_mounts'`）
+    - _需求：4.1, 4.2, 4.3, 4.4_
+  - [x] 5.2 实现
+    - 改动：新增 `src/octop/api/intranet_mounts.py`，包含 `_FORK_DISABLED_MOUNTS: frozenset[str] = frozenset()`、`resolve_router_ref`、`without_fork_disabled`（`_RouterMount` 只在 `TYPE_CHECKING` 下导入，见 design.md）。
+    - 改动：`src/octop/api/app.py` 增加一行 `from octop.api.intranet_mounts import without_fork_disabled`（按 isort 顺序放在 `octop.api.middleware…` 之前），并把 `_mount_routers` 的 `for spec in mounts:` 改为 `for spec in without_fork_disabled(mounts):`。
+    - 验证：`uv run pytest tests/unit/api tests/integration/test_scalar.py -q`
+    - 验证：`git diff --numstat 757fd12 -- src/octop/api/app.py`（期望 `2	1`）
+    - 验证：`uv run ruff check src/octop/api && uv run mypy src/octop/api/intranet_mounts.py src/octop/api/app.py`
+    - _需求：4.1, 4.2, 4.3, 4.4, 4.5, 10.3_
+
+- [x] 6. 连接器目录的 fork 删除集与追加项（测试先行，0.5 人日）
+  - [x] 6.1 先写会失败的测试
+    - 改动：新增 `tests/unit/connectors/test_catalog_intranet.py`：
+      - `list_catalog() == [e for e in catalog._BASE if e.kind not in catalog_intranet._FORK_REMOVED] + list(catalog_intranet._fork_entries())`；
+      - `_FORK_REMOVED` 是 `{e.kind for e in _BASE}` 的子集，失败时列出多余的 kind；
+      - `list_catalog()` 的 kind 两两不同，失败时列出重复的 kind；
+      - （实施：以下删除与追加的断言放进子进程，先改 `catalog_intranet` 再导入 `catalog`，见 design.md 测试策略。）monkeypatch `_FORK_REMOVED = frozenset({"notion"})`，并让 `_fork_entries` 返回一条以 `dataclasses.replace(get_catalog_entry("dify"), kind="bank-probe")` 构造的条目。先断言 `compose_catalog(_BASE)` 不含 `notion`，且最后一条是 `bank-probe`；再把 `catalog._CATALOG` monkeypatch 为该结果，断言 `get_catalog_entry("notion") is None`、`get_catalog_entry("bank-probe")` 非空、`"notion" not in mcp_oauth_remote_kinds()`。
+      - 导入顺序：`subprocess.run([sys.executable, "-c", code], check=True)` 分别执行"先 `import octop.infra.connectors.catalog_intranet` 再 `from octop.infra.connectors.catalog import list_catalog; list_catalog()`"与相反的顺序。
+    - 改动：新增 `tests/integration/test_connectors_catalog_intranet.py`：使用 `env` fixture，按上一条同样的方式 monkeypatch `octop.infra.connectors.catalog._CATALOG`，断言 `GET /api/connectors/catalog` 的 kind 列表不含 `notion`，且最后一项是 `bank-probe`。
+    - 验证：`uv run pytest tests/unit/connectors/test_catalog_intranet.py tests/integration/test_connectors_catalog_intranet.py -q`（期望失败，原因是找不到 `catalog_intranet`）
+    - _需求：5.1, 5.2, 5.3, 5.5_
+  - [x] 6.2 实现
+    - 改动：新增 `src/octop/infra/connectors/catalog_intranet.py`，包含 `_FORK_REMOVED`、`_fork_entries`、`compose_catalog`。只在 `TYPE_CHECKING` 下导入 `ConnectorCatalogEntry`，并在模块 docstring 中写明"不得在模块级导入 catalog"。
+    - 改动：`src/octop/infra/connectors/catalog.py` 中 ≈L96 的 `_CATALOG: tuple[ConnectorCatalogEntry, ...] = (` 改名为 `_BASE: …`；文件头 import 块加 `from octop.infra.connectors.catalog_intranet import compose_catalog`，在元组结束（≈L531）之后、`def list_catalog` 之前加入 `_CATALOG = compose_catalog(_BASE)`。23 条上游条目与三个读取函数一行不动。
+    - 验证：`uv run pytest tests/unit/connectors/test_catalog_intranet.py tests/unit/test_connectors.py tests/integration/test_connectors_catalog_intranet.py tests/integration/test_connectors_api.py -q`
+    - 验证：`uv run python -c "from octop.infra.connectors.catalog import list_catalog; assert len(list_catalog()) == 23; print('catalog-23')"`
+    - 验证：`git diff --numstat 757fd12 -- src/octop/infra/connectors/catalog.py`（期望删除列为 `1`，新增列不超过 `5`）
+    - 验证：`uv run ruff check src/octop/infra/connectors && uv run mypy src/octop/infra/connectors/catalog.py src/octop/infra/connectors/catalog_intranet.py`
+    - _需求：5.1, 5.2, 5.3, 5.4, 5.5, 10.3_
+
+- [x] 7. `make relock`（0.5 人日）
+  - [x] 7.1 先写会失败的契约测试
+    - 改动：在 `tests/unit/test_fork_isolation_contract.py` 追加 `test_makefile_intranet_defines_relock`：按行首正则 `^relock:` 查找目标，并断言 `help-intranet` 的配方中出现 `relock`。
+    - 验证：`uv run pytest tests/unit/test_fork_isolation_contract.py -q`（期望该用例失败）
+    - _需求：6.5, 10.2_
+  - [x] 7.2 实现
+    - 改动：在 `Makefile.intranet` 中追加 `relock` 目标（配方见 design.md），并在 `help-intranet` 中加两行 `relock` 说明。不改根 `Makefile`。
+    - 验证：`make -n relock PYPI_INDEX=https://pypi.example/simple NPM_REGISTRY=https://npm.example/ | rg -e '--default-index https://pypi.example/simple' -e '--registry=https://npm.example/'`（期望两行都命中）
+    - 验证：`make -n relock | rg -c -e '--default-index' -e '--registry'; echo "rg=$?"`（期望 `rg=1`，即变量为空时不传参数）
+    - 验证：`env PATH=/nonexistent "$(command -v make)" relock; echo "rc=$?"`（期望输出 `[relock] uv is required …` 并且 `rc=2`）
+    - 验证：`make relock && git diff --exit-code -- uv.lock dashboard/package-lock.json`（需要能访问默认 registry 或行内镜像；期望退出码为 0）
+    - 验证：`make relock PYPI_INDEX=https://pypi.org/simple NPM_REGISTRY=https://registry.npmjs.org/ 2>&1 | rg '^\[relock\]'`（期望两行提示，分别含 `<PYPI_INDEX>` 与 `<NPM_REGISTRY>` 占位符，且不含 `https://`；这里传入的正是默认 registry，所以锁文件仍不应变化）
+    - 验证：`! rg -n '://[^/@ ]+:[^/@ ]+@' uv.lock dashboard/package-lock.json`
+    - 验证：`uv run pytest tests/unit/test_fork_isolation_contract.py -q`
+    - _需求：6.1, 6.2, 6.3, 6.4, 6.5, 10.2_
+
+- [x] 8. fork 专属文档：`CHANGELOG-intranet.md`、`docs/api-intranet.md`、`docs/api.md` 指针（0.25 人日）
+  - 改动：先在 `tests/unit/test_fork_isolation_contract.py` 追加 `test_api_md_points_to_intranet_doc`（断言 `docs/api.md` 前 5 行含 `api-intranet.md`），确认它失败。
+  - 改动：新建 `CHANGELOG-intranet.md`，采用 design.md 中的结构。如果 `w0-02` 已建过该文件，保留它的条目并改成统一结构。补录 `w0-01`（取自其 PR 描述）、`w0-02`、`w0-03` 的条目；`w0-04` 的条目留到任务 11。
+  - 改动：新建 `docs/api-intranet.md`，写六节骨架，各节写"暂无"。
+  - 改动：在 `docs/api.md` 的 L2 空行之后插入指针行（文本见 design.md）和一个空行，其余不动。
+  - 验证：`uv run pytest tests/unit/test_fork_isolation_contract.py -q`
+  - 验证：`git diff --numstat 757fd12 -- docs/api.md`（期望 `2	0`）
+  - 验证：`git diff --stat 757fd12 -- CHANGELOG.md`（期望无输出）
+  - 验证：`rg -n '^## \[Unreleased\]|^### (新增|变更|移除|安全)|^## 上游同步记录|757fd12' CHANGELOG-intranet.md && rg -c '^- .w0-0[123]-' CHANGELOG-intranet.md`（期望计数不小于 3）
+  - 验证：`rg -c '^## ' docs/api-intranet.md`（期望 `6`）
+  - _需求：7.1, 7.2, 7.3, 7.4, 10.2_
+
+- [ ] 9. 上游同步手册（1 人日）
+  - [ ] 9.1 在完整历史上实测（未完成：需在 fork 仓库上 unshallow 并添加 `upstream`，属于首次同步时的操作；手册要求首次同步前按第 9 节重测并登记。实施时已在草稿目录的独立 clone 里跑通第 2 节命令：`--is-shallow-repository` 由 true 变 false、`git tag -l 'v*'` 31 个、`757fd12` 就是上游 `v1.0.1`。）
+    - 改动：在能访问上游或其镜像的环境里执行手册"一次性准备"一节的命令（unshallow、添加 `upstream`、拉取 tags、核对基线）。然后按 `--full-history --no-merges` 口径，对最近 4 个上游 `v*` 窗口复测"窗口命中 fork 改动面"的文件数与 i18n 热文件的行数。结果写进手册第 3 节，并登记到 `CHANGELOG-intranet.md` 的同步记录表。如果与全局约束第 5 节的 66 / 81 / 203 差异明显，在 PR 描述中说明，是否修改全局约束由负责人决定。
+    - 验证：`git rev-parse --is-shallow-repository`（期望 `false`）
+    - 验证：`git tag -l 'v*' --merged upstream/main --sort=-v:refname | head -5`（期望非空）
+    - 验证：`git merge-base --is-ancestor 757fd12 upstream/main && echo baseline-on-upstream`
+    - _需求：8.2, 8.5_
+  - [x] 9.2 撰写手册
+    - 改动：新建 `docs/intranet/upstream-sync.md`（中文），按 design.md 的十节与冲突规则表撰写。所有命令都要可以直接复制执行；上游地址写 `https://github.com/TencentCloud/Octop.git`，并注明行内用镜像地址替换。
+    - 验证：`for p in 'git fetch --unshallow' 'git remote add upstream' 'git fetch upstream --tags' 'git log --full-history --no-merges' '/hotfix/' 'cherry-pick -x -m 1' 'make relock' 'include Makefile.intranet' 'run_migrations' 'make test-postgresql' 'make check-frontend' 'CHANGELOG-intranet.md' '_DEFAULT_STATUS' 'git merge --abort'; do rg -q -F -e "$p" docs/intranet/upstream-sync.md || echo "missing: $p"; done`（期望无输出）
+    - 验证：`rg -n '\bpytest\b' docs/intranet/upstream-sync.md | rg -v 'uv run (python -m )?pytest'; echo "rg=$?"`（期望 `rg=1`，即没有裸 `pytest`）
+    - 验证：`rg -n -e '--include' docs/intranet/upstream-sync.md; echo "rg=$?"`（期望 `rg=1`）
+    - _需求：8.1, 8.3, 8.4, 8.5_
+
+- [x] 10. AGENTS.md 勘误（0.25 人日）
+  - 改动：按 design.md 的"AGENTS.md（修改）"一节修改 §5（`infra/gateway/` 行、`api/deps.py` 行、删除 `api/errors.py` 行并并入 `api/app.py` 行、`cli/` 表三行）、§8（一行）、§9（四行修正加一行新增），以及 §7 "Adding strings (checklist)" 的第 5 条。不碰 §7 Database 段。
+  - 验证：`rg -n 'jwt_tokens|_cmd\.py|api/errors\.py|gateway/processor\.py|agents/runtime\.py|routers/chat\.py' AGENTS.md; echo "rg=$?"`（期望 `rg=1`）
+  - 验证：`git diff -U0 -- AGENTS.md | rg '^[+-]' | rg -i 'migration|schema_version|forkNNN'; echo "rg=$?"`（期望 `rg=1`，即本次改动没有触及迁移段）
+  - 验证：`uv run python -c "import re,subprocess,pathlib; d=subprocess.run(['git','diff','-U0','--','AGENTS.md'],capture_output=True,text=True,encoding='utf-8').stdout; toks={t for l in d.splitlines() if l.startswith('+') for t in re.findall(r'\x60([^\x60 ]+/[^\x60 ]*)\x60',l)}; roots=[pathlib.Path(p) for p in ('.','src/octop','dashboard','src/octop/infra')]; bad=[t for t in toks if '*' not in t and '{' not in t and not any((r/t).exists() for r in roots)]; print('missing:',bad); assert not bad"`（期望输出 `missing: []`）
+  - _需求：9.1, 9.2, 9.3, 9.4_
+
+- [x] 11. 收尾（0.25 人日）
+  - 改动：在 `CHANGELOG-intranet.md` 的"新增"下写 `w0-04-fork-isolation-points` 条目，内容包括：
+    - 两对 overlay 的路径与"en / zh 同键、不删上游键"的规则；
+    - `_FORK_DISABLED_MOUNTS` 的引用格式；
+    - `_FORK_REMOVED` / `_fork_entries()`；
+    - `make relock PYPI_INDEX=… NPM_REGISTRY=…`；
+    - 两份 fork 文档与同步手册的位置；
+    - 本地复现命令。
+  - 改动：`docs/api-intranet.md`：本 spec 没有 API 变更（所有集合为空），保持"暂无"。
+  - 验证：`make install-frontend && make all`（期望全绿，并且 `git status --short` 中没有被格式化工具改出的额外文件）
+  - 验证：`cd dashboard && npx tsc -b && npm run lint && npm run test`
+  - 验证：`uv run pytest tests/unit/i18n tests/unit/test_fork_isolation_contract.py tests/unit/api/test_intranet_mounts.py tests/unit/connectors/test_catalog_intranet.py tests/integration/test_connectors_catalog_intranet.py -q`
+  - 验证：`git diff --stat 757fd12 -- src/octop/i18n/en.json src/octop/i18n/zh.json dashboard/src/locales/en.json dashboard/src/locales/zh.json CHANGELOG.md`（期望无输出）
+  - 验证：`rg -n 'w0-04' CHANGELOG-intranet.md`
+  - _需求：3.6, 7.1, 7.4, 10.4_

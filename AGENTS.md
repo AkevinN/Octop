@@ -88,7 +88,7 @@ cli/ ──► launch.py ──► api/ + infra/
 | `octop.i18n` | Locale JSON + `tr()` + per-namespace helpers | `infra/utils/locale`, stdlib | `api/`, `cli/`, `dashboard/` |
 | `octop.launch` | Wire `OctopServer`, `build_app`, uvicorn for `octop run` | `infra/`, `api/` | business logic; must not be imported by `infra/` |
 | `infra/utils/` | Pure helpers (paths, ulid, env files, Ollama) | stdlib, third-party | any other `infra/*` domain code |
-| `infra/db/repos/` | One repo per table — SQL only | `infra/db/_base`, `infra/utils/` | `agents/`, `gateway/`, `api/`, orchestration |
+| `infra/db/repos/` | One repo per table — SQL only | `infra/db/repos/_base`, `infra/db/pool`, `infra/utils/` | `agents/`, `gateway/`, `api/`, orchestration |
 | `infra/` (domain) | Business logic & orchestration | `infra/utils/`, `infra/db/`, `octop.config`, peer `infra/*` subpackages, `infra/errors`, `infra/metrics` | `api/`, `cli/`, `launch.py`, `dashboard/` |
 | `api/` | HTTP: routing, auth, SSE, OpenAPI | `infra/`, `octop.config`, sibling `api/*` | `cli/`, `launch.py`; no business rules that belong in `infra/` |
 | `cli/` | Terminal UX | `infra/`, `octop.config`, `launch.py`, sibling `cli/*` | `api/`; domain logic duplicated from `infra/` |
@@ -112,7 +112,7 @@ cli/ ──► launch.py ──► api/ + infra/
 | `infra/connectors/` | Connector catalog, OAuth, MCP gateway, credential crypto | `api/routers/connectors.py`, `internal_mcp.py`, `agents/manager.py` (MCP assembly) |
 | `infra/cron/` | Cron jobs, triggers, agent tool hooks | `server.py`, `api/routers/cron.py` |
 | `infra/db/` | `SqlitePool`, migrations, `RepoBundle` / `SharedServices` in `services.py` | all domain code needing persistence |
-| `infra/gateway/` | IM ingress (`processor.py`), threads, slash commands (`slash/`), bot setup (`bot_creators/`) | `server.py`, `api/routers/chat.py`, `channels.py` |
+| `infra/gateway/` | IM ingress (`process/processor.py`), threads, slash commands (`slash/`), bot setup (`bot_creators/`) | `server.py`, `api/routers/chat/`, `channels.py` |
 | `infra/setup/` | First-run wizard, system service install, TLS / Let's Encrypt | `server.py`, `launch.py`, `api/routers/setup.py`, `api/routers/tls.py` |
 | `infra/users/` | Users, roles, password hashing, `UserManager` | `server.py`, `api/routers/auth.py`, `users.py` |
 | `infra/errors.py` | `OctopError`, `ErrorCode` — shared exception types | everywhere in `infra/` and `api/` |
@@ -131,11 +131,10 @@ Only `launch.py` may import both `infra/server` and `api/app` in the same module
 
 | Path | Owns | Must NOT own |
 |------|------|--------------|
-| `api/app.py` | FastAPI factory, router registration, static dashboard mount | domain rules, SQL |
-| `api/deps.py`, `api/jwt_tokens.py` | JWT extraction, `current_user`, `get_server` | agent lifecycle, cron logic |
+| `api/app.py` | FastAPI factory, router registration, static dashboard mount, map `OctopError` → HTTP status + JSON | domain rules, SQL, new error semantics (add to `infra/errors.py`) |
+| `api/deps.py` | JWT sign/decode, `current_user`, `get_server` (JWT gate in `api/middleware/jwt_auth.py`) | agent lifecycle, cron logic |
 | `api/middleware/` | JWT gate, setup lockdown | business validation beyond auth/setup |
 | `api/openapi_meta.py` | Scalar tags, API intro text | route handlers |
-| `api/errors.py` | Map `OctopError` → HTTP status + JSON | new error semantics (add to `infra/errors.py`) |
 | `api/routers/` | One resource per module; Pydantic request/response models | persistence, harness calls — delegate to `infra/` |
 | `api/routers/browser/` | Browser session/stream/harness HTTP surface | Playwright logic (stays in harness or helpers here only as glue) |
 
@@ -144,15 +143,15 @@ Only `launch.py` may import both `infra/server` and `api/app` in the same module
 | Path | Owns |
 |------|------|
 | `cli/main.py` | Click entry, command registration |
-| `cli/*_cmd.py` | User-facing subcommands |
+| `cli/commands/*.py` | User-facing subcommands, lazy-loaded via `COMMANDS` in `cli/registry.py` |
 | `cli/support/db.py` | Offline DB (`open_cli_services`) |
 | `cli/support/offline_ops.py` | Local CRUD via repos (thin wrappers) |
 | `cli/support/embedded_ops.py` | Short-lived `OctopServer` for runtime ops |
 | `cli/support/acting.py` | Resolve `--user` / pinned defaults / agent owner |
 | `cli/support/ctx.py` | Root `--user` / `--agent` / `--json` resolution |
 | `cli/support/state.py` | Pinned `default_user` / `default_agent` in `cli_state.json` |
-| `cli/run_cmd.py` | `octop run` — delegates to `launch.run_foreground_blocking` |
-| `cli/init_cmd.py`, `cli/backup_cmd.py` | Local DB bootstrap / backup via `infra/db` |
+| `cli/commands/run.py` | `octop run` — delegates to `launch.run_foreground_blocking` |
+| `cli/commands/init.py`, `cli/commands/backup.py` | Local DB bootstrap / backup via `infra/db` |
 
 **CLI transport layers** (pick one per command; domain rules live in `infra/`, not duplicated in `cli/`):
 
@@ -219,8 +218,10 @@ New agents additionally keep system-scoped files under `{workspace}/.octop/` (e.
 **Chat attachments:** Dashboard uploads go to `{workspace}/inbound/` via `api/common/attachments.py` + `api/routers/uploads.py`, not a separate `~/.octop/uploads/` store.
 
 **Database:** SQLite and PostgreSQL share one schema. Add or change tables via a numbered pair
-`infra/db/migrations/00N_description.sql` **and** `00N_description.pg.sql`, then bump the
-version assertion in `tests/unit/db/test_db_pool.py` (currently `v == 7`). Rebuilds that SQLite
+`infra/db/migrations/00N_description.sql` **and** `00N_description.pg.sql`, then bump every
+`_schema_version` assertion (currently `15`, spread over 8 test files: 7 under `tests/unit/db/`
+plus `tests/unit/backup/test_system_archive.py`; the mid-upgrade `== 7` in `test_db_pool.py` is not
+a watermark assertion). Rebuilds that SQLite
 cannot express as `ALTER` live in `infra/db/migrate.py` helpers and must stay idempotent.
 
 Unreleased schema work on `develop` **folds into the current unreleased `00N`**, not a new
@@ -230,6 +231,22 @@ of every edit. The numbered SQL pair is the canonical v(N-1)→vN DDL (including
 `migrate.py` helpers must stay equivalent and idempotent for SQLite `ADD COLUMN` and for
 databases whose recorded version skipped the file. Do not re-apply a RENAME rebuild just to
 clamp `_schema_version`.
+
+**Fork migrations (intranet fork only):** never add an upstream-numbered `NNN_` file in this fork.
+Write schema changes as `infra/db/migrations/forkNNN_description.sql` **and**
+`forkNNN_description.pg.sql`. `_discover` never sees them; `run_fork_migrations()`
+(`infra/db/fork_migrate.py`), the last call in `run_migrations()`, applies them against their own
+`_fork_schema_version` watermark, so `_schema_version` and its test assertions never change for
+fork work. Specs write `forkNNN_<description>`; take the next free number when merging into the
+fork mainline, and never edit a merged fork file (fix forward with a new number). Each file runs
+in one transaction together with its watermark bump: no `BEGIN`/`COMMIT`, end statements with
+`;` + newline, no `$$` bodies (DO blocks, functions, triggers), no `?` inside literals; in
+`.pg.sql`, `CREATE TABLE` / `CREATE INDEX` / `ADD COLUMN` use `IF NOT EXISTS` and inserts must be
+idempotent. Backfills SQL cannot express portably, idempotent PG constraints, or changes that must
+guard a missing upstream table go in an idempotent Python step registered in `_FORK_PY_STEPS`.
+A fork FK onto an upstream table makes `pg_restore --clean` of an older backup skip that upstream
+table (exit code 1 is only logged), so restore such backups into an empty schema. Never fold fork schema into `_repair_legacy_schema`, `_ensure_*` helpers,
+`_apply_sqlite_migration`, or the `_reconcile_pre_squash_schema_version` ladder.
 
 Resource tables (API-visible entities: `agents`, `channels`, `threads`, `cron_jobs`,
 `knowledge_bases`, `knowledge_documents`, `skill_packages`, `published_experts`, …) use:
@@ -289,6 +306,7 @@ i18n/
 2. Add or extend a `domains/*.py` helper when the namespace is used in multiple call sites.
 3. If the key is an `ErrorCode` or `apiErrors` entry, update both backend `errors` and dashboard `apiErrors`.
 4. Run `uv run pytest tests/unit/i18n -q` (key parity + domain helpers).
+5. **Intranet fork:** put new or overridden strings in `src/octop/i18n/intranet/{en,zh}.json` and `dashboard/src/locales/intranet/{en,zh}.json` (deep-merged overlays, en/zh key sets must match); never add or delete keys in the upstream bundles.
 
 Do **not** use gettext (`.po` files). Do **not** embed user-visible English in `infra/` when a backend i18n key exists. Expert catalog (`infra/agents/experts/`) still uses embedded `label_zh`/`label_en` in source data — out of scope unless explicitly migrating that catalog.
 
@@ -341,7 +359,7 @@ Boundary rules are in [§5](#5-module-boundaries). Additionally:
   - `octop.utils.*` → `octop.infra.utils.*` (or `octop.infra.metrics` for metrics)
   - `octop.errors` / `octop.server` / `octop.shared` → `octop.infra.errors` / `octop.infra.server` / `octop.infra.db.services`
 - Do not import `api/` from `infra/` or `cli/` — use `launch.py` to wire HTTP serving.
-- Do not put domain logic in `api/routers/` or `cli/*_cmd.py` when it belongs in `infra/`.
+- Do not put domain logic in `api/routers/` or `cli/commands/*.py` when it belongs in `infra/`.
 - Do not import `infra/db/repos/*` from routers — use `server.services.*_repo` via `infra/` services or managers.
 - Do not write bare `pytest` — always `uv run pytest`.
 - Do not edit `src/octop/dashboard/` directly — build artifact; source is `dashboard/`.
@@ -351,12 +369,12 @@ Boundary rules are in [§5](#5-module-boundaries). Additionally:
 
 | Question | Location |
 |----------|----------|
-| How does auth work? | `api/jwt_tokens.py`, `api/deps.py`, `api/middleware/jwt_auth.py`, `api/routers/auth.py` |
+| How does auth work? | `api/deps.py`, `api/middleware/jwt_auth.py`, `api/routers/auth.py` |
 | Setup wizard (password file, tokens) | `infra/setup/`, `api/routers/setup.py` |
 | TLS / Let's Encrypt | `infra/setup/tls/`, `api/routers/tls.py` |
-| `octop run` boot sequence | `launch.py`, `cli/run_cmd.py` |
-| How is a message processed? | `infra/gateway/processor.py` → harness agent |
-| How are agents started/stopped? | `infra/agents/manager.py`, `infra/agents/runtime.py` |
+| `octop run` boot sequence | `launch.py`, `cli/commands/run.py` |
+| How is a message processed? | `infra/gateway/process/processor.py` → harness agent |
+| How are agents started/stopped? | `infra/agents/manager.py` (`start`, `stop`, `_start_agent`) |
 | How does cron work? | `infra/cron/manager.py`, `infra/cron/job.py` |
 | What DB tables exist? | `infra/db/migrations/` + `infra/db/repos/` |
 | What env vars are supported? | `config.py` |
@@ -373,6 +391,7 @@ Boundary rules are in [§5](#5-module-boundaries). Additionally:
 | Human-readable API reference | `docs/api.md` |
 | SharedServices / RepoBundle | `infra/db/services.py` |
 | Branching & release | [§10](#10-change-workflow) Branching & release; `CONTRIBUTING.md`; `.cursor/skills/publish` |
+| Intranet fork: isolation points, upstream sync | `docs/intranet/upstream-sync.md`, `CHANGELOG-intranet.md`, `docs/api-intranet.md` |
 
 ## 10. Change workflow
 

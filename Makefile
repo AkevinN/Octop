@@ -340,3 +340,4 @@ clean-online:
 .PHONY: version
 version:
 	@$(PYTHON) -c "import pathlib, re; t = pathlib.Path('pyproject.toml').read_text(); m = re.search(r'^version\\s*=\\s*\"([^\"]+)\"', t, re.M); print(m.group(1) if m else 'unknown')"
+include Makefile.intranet

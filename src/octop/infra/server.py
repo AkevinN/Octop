@@ -30,6 +30,7 @@ from octop.infra.setup import password_file as _wizard_pw
 from octop.infra.setup.password_file import WIZARD_FILE_NAME
 from octop.infra.setup.wizard_tokens import WizardTokenStore
 from octop.infra.users.manager import UserManager
+from octop.infra.utils.intranet_allowlist import configure_intranet_allowlist
 from octop.infra.utils.paths import PathLayout
 
 if TYPE_CHECKING:
@@ -205,6 +206,22 @@ def _attach_log_handler(target: logging.Logger, handler: TimedRotatingFileHandle
         target.addHandler(handler)
 
 
+def _apply_intranet_allowlist(config: OctopConfig) -> None:
+    """Inject the SSRF-guard allowlist; invalid config raises before any DB opens."""
+    allow = configure_intranet_allowlist(
+        cidrs=config.intranet_allow_cidrs,
+        host_suffixes=config.intranet_allow_host_suffixes,
+        allow_http=config.intranet_allow_http,
+    )
+    if not allow.is_empty:
+        logger.info(
+            "intranet outbound allowlist active: cidrs=%s host_suffixes=%s allow_http=%s",
+            [str(n) for n in allow.networks],
+            list(allow.host_suffixes),
+            allow.allow_http,
+        )
+
+
 @dataclass
 class AppRuntime:
     """Live singletons — constructed after boot."""
@@ -293,6 +310,7 @@ class OctopServer:
         self._setup_logging()
         config = ensure_mobile_capabilities_probed(self.paths.config)
         self.config = config
+        _apply_intranet_allowlist(config)
 
         self.expert_catalog = ExpertCatalog(
             default_library_root(),
@@ -342,6 +360,7 @@ class OctopServer:
             return
         config = load_config(self.paths.config)
         self.config = config
+        _apply_intranet_allowlist(config)
         db = open_database(config, self.paths)
         try:
             run_migrations(db)
