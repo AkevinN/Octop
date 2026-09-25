@@ -33,6 +33,7 @@ class BackupManifest:
     includes_plugins: bool = False
     includes_knowledge: bool = False
     includes_chats: bool = True
+    fork_schema_version: int = 0
 
     def to_json(self) -> str:
         payload: dict[str, Any] = {
@@ -50,6 +51,7 @@ class BackupManifest:
             "includes_plugins": self.includes_plugins,
             "includes_knowledge": self.includes_knowledge,
             "includes_chats": self.includes_chats,
+            "fork_schema_version": self.fork_schema_version,
             "agents": [asdict(a) for a in self.agents],
         }
         return json.dumps(payload, indent=2, ensure_ascii=False)
@@ -89,6 +91,7 @@ class BackupManifest:
             ),
             # Legacy archives dumped the full database; missing key means chats are present.
             includes_chats=bool(data["includes_chats"]) if "includes_chats" in data else True,
+            fork_schema_version=int(data.get("fork_schema_version", 0)),
         )
 
     @classmethod

@@ -39,6 +39,7 @@ from octop.infra.backup.snapshot import (
     snapshot_sqlite_file,
     upsert_users_into_pool,
 )
+from octop.infra.db.fork_migrate import current_fork_version, max_fork_version, set_fork_version
 from octop.infra.db.migrate import _current_version, _max_discovered_version, run_migrations
 from octop.infra.db.pool import DatabasePool, SqlitePool
 from octop.infra.db.repos.agents import AgentRepo
@@ -181,6 +182,7 @@ def _build_manifest(
         includes_plugins=include_plugins,
         includes_knowledge=include_knowledge,
         includes_chats=include_chats,
+        fork_schema_version=current_fork_version(pool),
     )
 
 
@@ -486,6 +488,21 @@ def restore_system_backup(
                 f"the maximum supported version {runtime_schema_version}",
                 details=details,
             )
+        runtime_fork_version = max_fork_version(pool.dialect)
+        if manifest.fork_schema_version > runtime_fork_version:
+            archive_version = f"{manifest.schema_version}+fork{manifest.fork_schema_version}"
+            runtime_version = f"{runtime_schema_version}+fork{runtime_fork_version}"
+            raise OctopError(
+                ErrorCode.BACKUP_SCHEMA_INCOMPATIBLE,
+                f"backup schema version {archive_version} is newer than "
+                f"the maximum supported version {runtime_version}",
+                details={
+                    "archive_schema_version": archive_version,
+                    "runtime_schema_version": runtime_version,
+                    "archive_fork_schema_version": manifest.fork_schema_version,
+                    "runtime_fork_schema_version": runtime_fork_version,
+                },
+            )
 
         db_path = extracted / manifest.db_file
         if not db_path.is_file():
@@ -531,6 +548,9 @@ def restore_system_backup(
         # preservation helper queries it. This keeps old backups usable after
         # tables gain required columns or are rebuilt by later migrations.
         try:
+            # pg_restore --clean keeps tables absent from the dump, so a stale
+            # fork watermark could survive; the manifest is authoritative.
+            set_fork_version(pool, manifest.fork_schema_version)
             run_migrations(pool)
         except Exception as exc:
             details = {

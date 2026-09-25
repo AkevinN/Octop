@@ -1711,3 +1711,6 @@ def run_migrations(db: DatabasePool) -> None:
     _ensure_user_policy_schema(db)
     _ensure_agent_profile_columns(db)
     _ensure_sso_provider_kind_schema(db)
+    from octop.infra.db.fork_migrate import run_fork_migrations
+
+    run_fork_migrations(db)
