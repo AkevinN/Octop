@@ -14,6 +14,7 @@ from octop.infra.db.migrate import run_migrations
 from octop.infra.db.services import SharedServices, build_shared_services
 from octop.infra.gateway.threads import ThreadRegistry
 from octop.infra.utils.env_file import apply_env_file, env_file_path
+from octop.infra.utils.intranet_allowlist import configure_intranet_allowlist
 from octop.infra.utils.paths import PathLayout
 
 
@@ -23,6 +24,11 @@ def open_cli_services(home: Path | None = None) -> Iterator[SharedServices]:
     paths = PathLayout(home) if home is not None else PathLayout.from_env()
     apply_env_file(env_file_path(paths.root))
     config = load_config(paths.config)
+    configure_intranet_allowlist(
+        cidrs=config.intranet_allow_cidrs,
+        host_suffixes=config.intranet_allow_host_suffixes,
+        allow_http=config.intranet_allow_http,
+    )
     db = open_database(config, paths)
     run_migrations(db)
     services = build_shared_services(db=db, paths=paths, config=config)

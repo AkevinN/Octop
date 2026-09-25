@@ -6,7 +6,11 @@ import re
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from octop.infra.utils.ssrf_guard import UnsafeOutboundUrl, validate_https_url
+from octop.infra.utils.ssrf_guard import (
+    UnsafeOutboundUrl,
+    intranet_http_allowed,
+    validate_https_url,
+)
 
 CUSTOM_MCP_KIND = "custom-mcp"
 CUSTOM_MCP_DISPLAY_NAME = "自定义 MCP"
@@ -131,7 +135,7 @@ def validate_mcp_http_url(url: str) -> str:
         return text
 
     # Public remote MCP: HTTPS only + existing SSRF guards (no private IPs).
-    if parsed.scheme != "https":
+    if parsed.scheme != "https" and not intranet_http_allowed(text):
         raise ValueError("non-local url must use https")
     try:
         validate_https_url(text, field="url")

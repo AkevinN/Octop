@@ -125,9 +125,9 @@
 
 ### 2. 配置期校验（fail-fast）
 
-`build_intranet_allowlist` 在注入时统一校验，任何一条不满足都抛 `ValueError`，并且不替换当前白名单：
+`configure_intranet_allowlist` 在注入时统一校验，任何一条不满足都抛 `ValueError`，并且不替换当前白名单：
 
-- **网段**：`ipaddress.ip_network(s, strict=True)`，主机位非零视为错误（防手误）；与 `HARD_DENY_NETWORKS` 或 `::ffff:0:0/96` 相交视为错误，这样 `0.0.0.0/0`、`::/0`、`127.0.0.0/8`、`169.254.0.0/16` 都无法配置；去重但保持顺序。
+- **网段**：`ipaddress.ip_network(s, strict=True)`，主机位非零视为错误（防手误）；与 `_HARD_DENY`（含 `::ffff:0:0/96`）相交视为错误，这样 `0.0.0.0/0`、`::/0`、`127.0.0.0/8`、`169.254.0.0/16` 都无法配置；去重但保持顺序。
 - **后缀**：小写，去掉首尾 `.` 和空白；不能为空；不能含 `*`、`/`、`:` 或空白；不能是 IP 字面量；不能是 `localhost` 或以 `.localhost` 结尾；至少两段，且没有空标签。
 - **跨字段**：配置了后缀或打开 `allow_http`，但 `networks` 为空，视为错误。否则会出现"配了却永远不生效"的死配置。
 - 错误消息以配置键名开头（`intranet_allow_cidrs: …`、`intranet_allow_host_suffixes: …`、`intranet_allow_http requires intranet_allow_cidrs`），与 `config.py` 既有的英文 `ValueError` 一样面向运维，不是终端用户文案，不进 i18n。
@@ -136,41 +136,31 @@
 
 ```python
 # ssrf_guard.py
-from urllib.parse import ParseResult, urlparse
 from octop.infra.utils.intranet_allowlist import IntranetAllowlist, current_intranet_allowlist
 
-def _http_host_permitted(parsed: ParseResult, allow: IntranetAllowlist) -> bool:
-    if parsed.scheme != "http" or not allow.allow_http:      # 空白名单在此短路
-        return False
-    host = (parsed.hostname or "").lower().rstrip(".")
-    return bool(host) and allow.permits_http_host(host)
-
 def intranet_http_allowed(url: str) -> bool:                 # 新增公开函数
-    return _http_host_permitted(urlparse(url), current_intranet_allowlist())
+    allow = current_intranet_allowlist()
+    parsed = urlparse(url)
+    return (parsed.scheme == "http" and allow.allow_http     # 空白名单在此短路
+            and allow.trusts_host((parsed.hostname or "").rstrip(".")))
 
 def _parse_https_host(url):                                  # 放行点 1
     parsed = urlparse(url)
-    if parsed.scheme != "https" and not _http_host_permitted(parsed, current_intranet_allowlist()):
+    if parsed.scheme != "https" and not intranet_http_allowed(url):
         raise UnsafeOutboundUrl("only https URLs are allowed")
     ...                                                      # 其余不变
 
-def _check_ip_not_private(ip_str, *, allow: IntranetAllowlist | None = None):   # 放行点 2
+def _check_ip_not_private(ip_str, allow: IntranetAllowlist | None = None):   # 放行点 2
     addr = ipaddress.ip_address(ip_str)
-    if <基线条件>:
-        if allow is not None and allow.permits_ip(addr):
-            return
+    if <基线条件> and not (allow is not None and allow.permits_ip(addr)):
         raise UnsafeOutboundUrl("private or reserved IP addresses are not allowed")
 
 def _check_ip_literal(host):                                 # 放行点 3 的落点（validate_https_url 经由它）
     ...
-    _check_ip_not_private(host, allow=current_intranet_allowlist())
+    _check_ip_not_private(host, current_intranet_allowlist())
 
-def _check_resolved_ip(ip_str, *, allow=None, plaintext=False):
-    if plaintext:
-        if allow is None or not allow.permits_ip(ipaddress.ip_address(ip_str)):
-            raise UnsafeOutboundUrl("only https URLs are allowed")
-        return
-    _check_ip_not_private(ip_str, allow=allow)
+def _check_resolved_ip(ip_str, allow=None):
+    _check_ip_not_private(ip_str, allow)
 
 async def _resolve_validated_ip(url):                        # 放行点 4
     host, port = _parse_https_host(url)
@@ -178,9 +168,11 @@ async def _resolve_validated_ip(url):                        # 放行点 4
     plaintext = urlparse(url).scheme == "http"               # 只有放行点 1 放过的 http 才能走到这里
     infos = await loop.getaddrinfo(host, port or (80 if plaintext else 443), ...)
     ...                                                      # gaierror / 空结果处理不变
-    trusted = allow if allow.host_is_trusted(host) else None
+    trusted = allow if allow.trusts_host(host) else None
     for info in infos:
-        _check_resolved_ip(info[4][0], allow=trusted, plaintext=plaintext)
+        if plaintext and not allow.permits_ip(ipaddress.ip_address(info[4][0])):
+            raise UnsafeOutboundUrl("only https URLs are allowed")
+        _check_resolved_ip(info[4][0], trusted)
     return infos[0][4][0]
 ```
 
@@ -188,9 +180,9 @@ async def _resolve_validated_ip(url):                        # 放行点 4
 
 **空白名单逐字节不变的论证：**
 
-- 放行点 1：默认 `allow_http=False`，`_http_host_permitted` 在读取 `parsed.hostname` / `parsed.port` 之前就返回 `False`，异常类型、消息与抛出顺序都和基线相同。`https://example.com:abc/` 仍由原位置的 `parsed.port` 抛 `ValueError`。
+- 放行点 1：默认 `allow_http=False`，`intranet_http_allowed` 在读取 `parsed.hostname` / `parsed.port` 之前就返回 `False`，异常类型、消息与抛出顺序都和基线相同。`https://example.com:abc/` 仍由原位置的 `parsed.port` 抛 `ValueError`。
 - 放行点 2、3：`permits_ip` 在 `networks` 为空时恒为假，所以仍抛原消息。
-- 放行点 4：`plaintext` 恒为假，端口仍是 `port or 443`；`host_is_trusted` 是纯字符串运算，结果只在 `permits_ip` 为真时才有影响。
+- 放行点 4：`plaintext` 恒为假，端口仍是 `port or 443`；`trusts_host` 不抛异常，空白名单下恒为假，所以 `trusted` 恒为 `None`。
 
 ### 4. 消费方
 
@@ -199,7 +191,7 @@ async def _resolve_validated_ip(url):                        # 放行点 4
 
 ### 5. 注入
 
-- `OctopServer` 新增私有方法 `_apply_intranet_allowlist(config)`，在 `start()` ≈L295 与 `bind_control_plane()` ≈L344 两处 `self.config = config` 之后各调一次。两处都在 `open_database` 之前，配置非法时不会留下打开的连接池。延迟控制面（首装向导）模式也会注入。白名单非空时打一条 INFO 日志。
+- `server.py` 新增模块级私有函数 `_apply_intranet_allowlist(config)`，在 `start()` ≈L295 与 `bind_control_plane()` ≈L344 两处 `self.config = config` 之后各调一次。两处都在 `open_database` 之前，配置非法时不会留下打开的连接池。延迟控制面（首装向导）模式也会注入。白名单非空时打一条 INFO 日志。
 - 默认配置同样调用 setter，于是每次启动都会把白名单重置为配置值，不会残留同进程前一次注入的值（需求 6.2）。
 - `rebind_control_plane` 不重读白名单：向导只写 `database` 段，白名单键不变；改白名单须重启，这与 AGENTS.md "config 写入在重启后生效"的约定一致。
 - CLI 离线：`open_cli_services` 在 `load_config` 之后调用同一个 setter。今天没有离线 CLI 命令触达守卫消费方，这里接线是为了遵守全局约束第 2 节，防止将来新增命令时成为死开关。内嵌命令（`cli/support/embedded_ops.py`）经 `OctopServer.start()` 自动覆盖。
@@ -209,21 +201,19 @@ async def _resolve_validated_ip(url):                        # 放行点 4
 | 文件 | 类型 | 改动 |
 |---|---|---|
 | `src/octop/infra/utils/intranet_allowlist.py` | 新增 | 白名单模型、校验、硬拒集、setter / getter；只依赖标准库 |
-| `src/octop/infra/utils/ssrf_guard.py` | 修改 | 四个放行点 + `_http_host_permitted` + `intranet_http_allowed`；docstring |
+| `src/octop/infra/utils/ssrf_guard.py` | 修改 | 四个放行点 + `intranet_http_allowed`；docstring |
 | `src/octop/infra/connectors/custom_mcp.py` | 修改 | ≈L9 import，≈L134 条件 |
-| `src/octop/config.py` | 修改 | 三触点 + `_parse_str_list` / `_parse_json_bool` / `_split_env_list` 三个私有 helper |
-| `src/octop/infra/server.py` | 修改 | `_apply_intranet_allowlist` + 两处单行调用 |
+| `src/octop/config.py` | 修改 | 三触点 + `_str_list_key` / `_bool_key` 两个私有 helper（env 列表内联切分，同 `OCTOP_CORS_ORIGINS`） |
+| `src/octop/infra/server.py` | 修改 | 模块级 `_apply_intranet_allowlist` + 两处单行调用 |
 | `src/octop/cli/support/db.py` | 修改 | import + `open_cli_services` 内一处调用 |
-| `tests/support/outbound.py` | 新增 | 测试辅助：`fake_getaddrinfo(monkeypatch, table)` 与 `record_pinned_transport(monkeypatch, handler)`（不依赖新模块，基线上即可用）；`use_intranet_allowlist(**kw)` 上下文管理器（退出时重置为空，新模块落地后追加） |
+| `tests/support/outbound.py` | 新增 | 测试辅助：`fake_dns`、`record_pinned`、`outcome` / `expected`、`check_outbound`、`use_intranet_allowlist(**kw)`（退出时重置为空）；快照语料 `BASELINE_CASES` 与代表性白名单 `ALLOW` / `HTTPS_ALLOW` |
 | `tests/unit/utils/test_ssrf_guard_baseline.py` | 新增 | 默认行为快照 |
-| `tests/unit/utils/test_intranet_allowlist.py` | 新增 | 模型与校验 |
-| `tests/unit/utils/test_ssrf_guard_intranet.py` | 新增 | 放行点、防重绑定、http 开关、钉 IP、重定向、只放宽不变式 |
+| `tests/unit/utils/test_intranet_allowlist.py` | 新增 | 校验，以及放行点、防重绑定、http 开关、钉 IP、重定向、只放宽不变式（原计划的 `test_ssrf_guard_intranet.py` 并入此文件） |
 | `tests/unit/connectors/test_ssrf_intranet_consumers.py` | 新增 | custom_mcp、weknora、OAuth、语音 |
 | `tests/unit/test_config_intranet_allowlist.py` | 新增 | 三触点与类型校验 |
-| `tests/unit/cli/test_open_cli_services_intranet_allowlist.py` | 新增 | CLI 离线注入 |
-| `tests/integration/test_ssrf_intranet_allowlist.py` | 新增 | 服务启动注入、fail-fast、INFO 日志、API 端到端 |
+| `tests/integration/test_ssrf_intranet_allowlist.py` | 新增 | 服务启动与 `bind_control_plane` 注入、CLI 离线注入、fail-fast、INFO 日志、API 端到端 |
 | `docs/intranet/ssrf-intranet-allowlist.md` | 新增 | 部署文档 |
-| `CHANGELOG-intranet.md` | 修改 | 追加条目（文件由 `w0-04` 建立） |
+| `CHANGELOG-intranet.md` | 修改 | 追加条目（文件由 `w0-04` 建立；未合入时由 `w0-04` 补录） |
 
 ### `src/octop/infra/utils/intranet_allowlist.py`（新增）
 
@@ -231,12 +221,10 @@ async def _resolve_validated_ip(url):                        # 放行点 4
 IPNetwork: TypeAlias = ipaddress.IPv4Network | ipaddress.IPv6Network
 IPAddress: TypeAlias = ipaddress.IPv4Address | ipaddress.IPv6Address
 
-HARD_DENY_NETWORKS: tuple[IPNetwork, ...]
+_HARD_DENY: tuple[IPNetwork, ...]
 # 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4,
-# ::/128, ::1/128, fe80::/10, ff00::/8。配置期另拒 ::ffff:0:0/96
-
-def normalize_ip(addr: IPAddress) -> IPAddress: ...          # IPv4 映射 IPv6 → IPv4
-def is_hard_denied(addr: IPAddress) -> bool: ...             # 归一化后判 loopback/link_local/multicast/unspecified/reserved
+# ::/128, ::1/128, ::ffff:0:0/96, fe80::/10, ff00::/8。只在配置期比对：
+# 已配置网段不可能与之相交，运行期无需再判（IPv4 映射地址按 IPv4 比对）
 
 @dataclass(frozen=True)
 class IntranetAllowlist:
@@ -246,17 +234,12 @@ class IntranetAllowlist:
 
     @property
     def is_empty(self) -> bool: ...                          # not self.networks
-    def permits_ip(self, addr: IPAddress) -> bool: ...       # 非硬拒 且 落在某个网段内
-    def host_is_trusted(self, host: str) -> bool: ...        # IP 字面量 → True；主机名 → 按标签边界匹配后缀
-    def permits_http_host(self, host: str) -> bool: ...      # allow_http 且（字面量 → permits_ip；主机名 → 后缀匹配）
-
-def build_intranet_allowlist(
-    *, cidrs: Iterable[str], host_suffixes: Iterable[str], allow_http: bool
-) -> IntranetAllowlist: ...                                  # 校验失败抛 ValueError
+    def permits_ip(self, addr: IPAddress) -> bool: ...       # IPv4 映射先归一化，再判是否落在某个网段内
+    def trusts_host(self, host: str) -> bool: ...            # IP 字面量 → permits_ip；主机名 → 按标签边界匹配后缀
 
 def configure_intranet_allowlist(
     *, cidrs: Iterable[str] = (), host_suffixes: Iterable[str] = (), allow_http: bool = False
-) -> IntranetAllowlist: ...                                  # 先 build，成功后原子替换模块级 _current；无参调用 = 重置为空
+) -> IntranetAllowlist: ...                                  # 校验失败抛 ValueError 且不替换；成功后原子替换模块级 _current；无参调用 = 重置为空
 
 def current_intranet_allowlist() -> IntranetAllowlist: ...
 ```
@@ -266,18 +249,18 @@ def current_intranet_allowlist() -> IntranetAllowlist: ...
 ### `src/octop/infra/utils/ssrf_guard.py`（修改）
 
 ```python
-def intranet_http_allowed(url: str) -> bool: ...                                   # 新增公开函数
-def _http_host_permitted(parsed: ParseResult, allow: IntranetAllowlist) -> bool: ... # 新增私有函数
-def _check_ip_not_private(ip_str: str, *, allow: IntranetAllowlist | None = None) -> None: ...
-def _check_resolved_ip(ip_str: str, *, allow: IntranetAllowlist | None = None, plaintext: bool = False) -> None: ...
+def intranet_http_allowed(url: str) -> bool: ...    # 新增公开函数；_parse_https_host 直接调用它
+def _check_ip_not_private(ip_str: str, allow: IntranetAllowlist | None = None) -> None: ...
+def _check_resolved_ip(ip_str: str, allow: IntranetAllowlist | None = None) -> None: ...
+# 明文检查（每个解析结果都须 permits_ip）内联在 _resolve_validated_ip
 ```
 
-新增参数都是仅限关键字并带默认值，未知的外部调用方保持基线行为。
+新增参数都带默认值，未知的外部调用方保持基线行为。
 
 ### `src/octop/infra/server.py`（修改）
 
 ```python
-def _apply_intranet_allowlist(self, config: OctopConfig) -> None:
+def _apply_intranet_allowlist(config: OctopConfig) -> None:   # 模块级函数，start() 与 bind_control_plane() 共用
     allowlist = configure_intranet_allowlist(
         cidrs=config.intranet_allow_cidrs,
         host_suffixes=config.intranet_allow_host_suffixes,
@@ -310,15 +293,15 @@ def _apply_intranet_allowlist(self, config: OctopConfig) -> None:
    `intranet_allow_cidrs: list[str] = field(default_factory=list)`、
    `intranet_allow_host_suffixes: list[str] = field(default_factory=list)`、
    `intranet_allow_http: bool = False`。
-2. **env 覆盖块**：在 `load_config` 的 `OCTOP_BROWSER_IDLE_TIMEOUT_MINUTES` 块（≈L499-509）之后追加三段 `if v := os.environ.get(...)`。列表键用 `_split_env_list(v)`；布尔键用 `_coerce_bool("OCTOP_INTRANET_ALLOW_HTTP", v, merged.get("intranet_allow_http") is True)`。
+2. **env 覆盖块**：在 `load_config` 的 `OCTOP_BROWSER_IDLE_TIMEOUT_MINUTES` 块（≈L499-509）之后追加三段 `if v := os.environ.get(...)`。列表键按 `OCTOP_CORS_ORIGINS` 的写法逗号切分；布尔键用 `_coerce_bool("OCTOP_INTRANET_ALLOW_HTTP", v, merged.get("intranet_allow_http") is True)`。
 3. **逐字段构造**：在 `return OctopConfig(...)`（≈L592）末尾追加
-   `intranet_allow_cidrs=_parse_str_list("intranet_allow_cidrs", merged.get("intranet_allow_cidrs"))`、
-   `intranet_allow_host_suffixes=_parse_str_list("intranet_allow_host_suffixes", merged.get("intranet_allow_host_suffixes"))`、
-   `intranet_allow_http=_parse_json_bool("intranet_allow_http", merged.get("intranet_allow_http", False))`。
+   `intranet_allow_cidrs=_str_list_key(merged, "intranet_allow_cidrs")`、
+   `intranet_allow_host_suffixes=_str_list_key(merged, "intranet_allow_host_suffixes")`、
+   `intranet_allow_http=_bool_key(merged, "intranet_allow_http")`。
 
 `_defaults_for_file` 不改。它自动把三个默认值写进首次生成的 `config.json`（需求 5.3）。与既有的 `OCTOP_CORS_ORIGINS` 一致，环境变量设为空串不会清空文件值，要清空须改文件。`w1-02` 合入的"三触点单测"会自动覆盖这三个字段。
 
-`config.py` 只做类型校验；语义校验（网段、后缀、跨字段）在 `intranet_allowlist.build_intranet_allowlist` 里做，因为硬拒集属于 utils 层，而 `config.py` 不得 import `infra`。
+`config.py` 只做类型校验；语义校验（网段、后缀、跨字段）在 `intranet_allowlist.configure_intranet_allowlist` 里做，因为硬拒集属于 utils 层，而 `config.py` 不得 import `infra`。
 
 ## 错误处理
 
@@ -351,10 +334,10 @@ def _apply_intranet_allowlist(self, config: OctopConfig) -> None:
 |---|---|---|
 | 单测：基线快照 | 上文"基线行为实测"整张表，外加解析期三类（放行、私网、无法解析）与 `safe_request` 的钉 IP 与拒绝；精确比对返回值、异常类型与 `str(exc)`；在基线代码上先跑通 | `uv run pytest tests/unit/utils/test_ssrf_guard_baseline.py -q` |
 | 单测：模型与校验 | 网段、后缀、跨字段校验；硬拒集；IPv4 映射归一化；标签边界匹配；非法配置不替换当前值；无参调用重置 | `uv run pytest tests/unit/utils/test_intranet_allowlist.py -q` |
-| 单测：放行点 | 需求 2、3、4 全部条目；3xx 不跟随；只放宽不变式（对快照语料中基线放行的输入，在代表性白名单下断言结果不变） | `uv run pytest tests/unit/utils/test_ssrf_guard_intranet.py -q` |
+| 单测：放行点 | 需求 2、3、4 全部条目；3xx 不跟随；只放宽不变式（对快照语料中基线放行的输入，在代表性白名单下断言结果不变） | `uv run pytest tests/unit/utils/test_intranet_allowlist.py -q` |
 | 单测：消费方 | `validate_mcp_http_url`、`normalize_weknora_base_url`、`_ensure_mcp_oauth_url`、`_guard_voice_base_url` | `uv run pytest tests/unit/connectors/test_ssrf_intranet_consumers.py -q` |
 | 单测：配置 | 文件值、env 覆盖、首次写出默认值、类型错误 | `uv run pytest tests/unit/test_config_intranet_allowlist.py tests/unit/test_config.py -q` |
-| 单测：CLI 离线 | `open_cli_services(home=tmp_octop_home)` 后 getter 等于配置值 | `uv run pytest tests/unit/cli/test_open_cli_services_intranet_allowlist.py -q` |
+| CLI 离线（并入集成文件） | `open_cli_services(home=tmp_octop_home)` 后 getter 等于配置值 | `uv run pytest tests/integration/test_ssrf_intranet_allowlist.py -q` |
 | 回归：既有用例 | 4 个既有守护文件 + OAuth discovery，不改一字 | `uv run pytest tests/unit/utils/test_ssrf_guard.py tests/unit/connectors/test_custom_mcp.py tests/unit/connectors/test_mcp_oauth_ssrf.py tests/unit/connectors/test_oauth_discovery.py tests/unit/test_connectors.py -q` |
 | 集成 | 写 `config.json` 后经 `octop_client` 启动：getter 等于配置值；默认配置启动即重置；非法网段时 `OctopServer.start()` 抛 `ValueError`；INFO 日志（`caplog`，logger `octop.infra.server`）；管理员 `PUT /api/connectors/custom-mcp` 放行与拒绝两向。鉴权沿用 `tests/integration/conftest.py` 的 `bootstrap_admin` + `auth_header` 写法，以 `w0-03` 合入后的签名为准 | `uv run pytest tests/integration/test_ssrf_intranet_allowlist.py -q` |
 | 前端 | 无（不改 `dashboard/`） | — |
@@ -391,7 +374,7 @@ def _apply_intranet_allowlist(self, config: OctopConfig) -> None:
 | 网段配得过宽（如 `10.0.0.0/8` 覆盖了数据库、管理网） | 连接器 / 语音可以打到这些主机 | 文档要求按服务配最小网段与后缀；启动日志列出生效值；超网与硬拒段在配置期被拒 |
 | 打开 http 后，OAuth 令牌可能明文传输 | 令牌泄露 | 默认关闭；文档写明 http 只给不走 OAuth 的内部服务 |
 | fail-fast 让配置错误的实例起不来 | 可用性 | 错误消息指出键与条目；回滚方法是清空三个键 |
-| xdist 下模块级状态在测试间泄漏 | 用例互相污染，甚至让安全用例假绿 | 所有新用例经 `use_intranet_allowlist` 在退出时重置；基线快照文件用 autouse fixture 强制空白名单 |
+| xdist 下模块级状态在测试间泄漏 | 用例互相污染，甚至让安全用例假绿 | 所有注入非空白名单的用例经 `use_intranet_allowlist` 在退出时重置；泄漏只会让快照与既有安全用例变红，不会假绿 |
 | 基线缺口：`100.64.0.0/10` 不拒（阿里云元数据 `100.100.100.200`） | 部署在阿里云 / 专有云时存在 SSRF 读元数据的风险 | 本 spec 受"默认不变"约束不改；列入待确认，按部署平台决定是否另立热修 |
 | 基线缺口：`issuer_base_domain` 取末两段 | 多段公共后缀下 OAuth 同域判断过宽；打开白名单后，被投毒的元数据可能把请求指向网段内其他主机 | 仍受网段、后缀、硬拒集三重约束；列入待确认 |
 | 基线缺口：streamable_http 探测与运行期 MCP、语音请求不钉 IP | DNS 重绑定窗口 | 移交 `w3-06`（MCP）；语音列入待确认 |
