@@ -5,7 +5,7 @@
 # database and never export it while running `make test` (-n auto runs the PG
 # tests in parallel and they collide).
 
-.PHONY: help-intranet install-frontend test-frontend check-frontend test-postgresql
+.PHONY: help-intranet install-frontend test-frontend check-frontend test-postgresql relock
 
 help-intranet:
 	@echo "Intranet fork targets (Makefile.intranet):"
@@ -15,6 +15,8 @@ help-intranet:
 	@echo "  test-postgresql    pytest -m postgresql -n 0; a skipped postgresql test fails the run"
 	@echo "                     needs OCTOP_TEST_DATABASE_URL=<dedicated DB> (tests DROP SCHEMA public);"
 	@echo "                     do not export it for make test (parallel PG tests collide)"
+	@echo "  relock             regenerate uv.lock + dashboard/package-lock.json from the current manifests"
+	@echo "                     (PYPI_INDEX=<url> NPM_REGISTRY=<url> pick the registries; no upgrades)"
 
 install-frontend:
 	cd $(DASHBOARD_DIR) && npm ci --no-audit --no-fund $(if $(strip $(NPM_REGISTRY)),--registry=$(strip $(NPM_REGISTRY)))
@@ -31,3 +33,12 @@ test-postgresql:
 		exit 2; \
 	fi
 	$(PYTHON) -m pytest -p tests.support.pg_strict -m postgresql -n 0 -rs
+
+# Upstream sync: take upstream's lock files on conflict, then regenerate them here.
+# Registry URLs may embed credentials, so only placeholders are echoed.
+relock:
+	@command -v uv >/dev/null 2>&1 || { echo "[relock] uv is required (pip cannot write uv.lock)"; exit 2; }
+	@echo "[relock] uv lock$(if $(strip $(PYPI_INDEX)), --default-index <PYPI_INDEX>)"
+	@uv lock $(if $(strip $(PYPI_INDEX)),--default-index $(strip $(PYPI_INDEX)))
+	@echo "[relock] npm install --package-lock-only$(if $(strip $(NPM_REGISTRY)), --registry=<NPM_REGISTRY>)"
+	@cd $(DASHBOARD_DIR) && npm install --package-lock-only --ignore-scripts --no-audit --no-fund $(if $(strip $(NPM_REGISTRY)),--registry=$(strip $(NPM_REGISTRY)))

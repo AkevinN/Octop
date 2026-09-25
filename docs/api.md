@@ -1,5 +1,7 @@
 # API Reference
 
+> **Intranet fork:** routes this build removes or adds, auth differences and fork error codes are listed in [api-intranet.md](api-intranet.md).
+
 Every route is mounted under `/api`. JSON unless otherwise noted; SSE
 endpoints emit `text/event-stream`; chat turns use a WebSocket
 described in [Chat (WebSocket)](#chat-websocket).

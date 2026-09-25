@@ -169,9 +169,9 @@
 
 | 文件 | 类型 | 改动 |
 |---|---|---|
-| `src/octop/i18n/overlay.py` | 新增 | `OVERLAY_DIR`、`deep_merge`、`_overlay_root`、`read_overlay`、`with_overlay` |
+| `src/octop/i18n/overlay.py` | 新增 | `_OVERLAY_ROOT`、`deep_merge`、`read_overlay` |
 | `src/octop/i18n/intranet/en.json`、`zh.json` | 新增 | 内容为 `{}` |
-| `src/octop/i18n/loader.py` | 修改 | 1 行 import；`_load_all` 循环体内 `out[loc] = json.loads(raw)` 改为 `out[loc] = with_overlay(json.loads(raw), loc)` |
+| `src/octop/i18n/loader.py` | 修改 | 1 行 import；`_load_all` 循环体内 `out[loc] = json.loads(raw)` 改为 `out[loc] = deep_merge(json.loads(raw), read_overlay(loc))` |
 | `dashboard/src/i18nIntranet.ts` | 新增 | `applyIntranetOverlay(locale)` |
 | `dashboard/src/locales/intranet/en.json`、`zh.json` | 新增 | 内容为 `{}` |
 | `dashboard/src/i18n.ts` | 修改 | 1 行 import；`ensureLocaleBundle` 的 if 块内、`addResourceBundle` 之后 1 行；`initI18n` 中 `await i18n.use(initReactI18next).init({...})` 之后 1 行 |
@@ -180,16 +180,15 @@
 | `tests/unit/i18n/test_errors.py` | 修改 | 两个用例改用辅助函数（各 2-3 行） |
 | `tests/unit/i18n/test_tools.py` | 修改 | `test_dashboard_tools_match_backend` 改用辅助函数 |
 | `tests/unit/i18n/test_skills.py` | 修改 | `test_dashboard_skill_labels_match_backend` 改用辅助函数 |
-| `tests/unit/i18n/test_intranet_overlay.py` | 新增 | 合并语义、探针、打包、两对 overlay 的对等与形状 |
-| `tests/integration/test_intranet_overlay_api.py` | 新增 | `GET /api/i18n/tools`、`GET /api/i18n/skills` 返回 overlay 值 |
+| `tests/unit/i18n/test_intranet_overlay.py` | 新增 | 合并语义、探针（含用裸 `FastAPI` 挂 `i18n.router` 请求 `GET /api/i18n/tools`、`GET /api/i18n/skills`）、三种坏文件、两对 overlay 的对等与形状 |
 | `src/octop/api/intranet_mounts.py` | 新增 | `_FORK_DISABLED_MOUNTS`、`resolve_router_ref`、`without_fork_disabled` |
 | `src/octop/api/app.py` | 修改 | 1 行 import；`_mount_routers` 循环头 1 行 |
 | `tests/unit/api/test_intranet_mounts.py` | 新增 | 过滤、fail closed、登记项有效性 |
 | `src/octop/infra/connectors/catalog_intranet.py` | 新增 | `_FORK_REMOVED`、`_fork_entries`、`compose_catalog` |
-| `src/octop/infra/connectors/catalog.py` | 修改 | ≈L96 `_CATALOG` 改名 `_BASE`；≈L531 之后加 import 与 `_CATALOG = compose_catalog(_BASE)` |
-| `tests/unit/connectors/test_catalog_intranet.py` | 新增 | 合成语义、删除集有效性、kind 唯一、导入顺序 |
+| `src/octop/infra/connectors/catalog.py` | 修改 | 文件头 import 块加 1 行 import；≈L96 `_CATALOG` 改名 `_BASE`；≈L531 之后加 `_CATALOG = compose_catalog(_BASE)` |
+| `tests/unit/connectors/test_catalog_intranet.py` | 新增 | 合成语义、删除集有效性、kind 唯一；子进程先改 `catalog_intranet` 再导入 `catalog`（守住合成钩子）与反向导入顺序 |
 | `tests/integration/test_connectors_catalog_intranet.py` | 新增 | `GET /api/connectors/catalog` 过滤与追加 |
-| `Makefile.intranet` | 修改 | `PYPI_INDEX ?=`、`relock` 目标、`help-intranet` 增加一行 |
+| `Makefile.intranet` | 修改 | `relock` 目标、`help-intranet` 增加两行 |
 | `tests/unit/test_fork_isolation_contract.py` | 新增 | 非 Python 钩子的契约测试 |
 | `CHANGELOG-intranet.md` | 新增（或统一已有格式） | 见下文 |
 | `docs/api-intranet.md` | 新增 | 六节骨架 |
@@ -207,7 +206,7 @@ over the upstream bundles by ``loader._load_all``. Do not add or delete keys in 
 upstream ``en.json`` / ``zh.json`` from the fork. Keep en/zh overlay key sets equal.
 """
 
-OVERLAY_DIR = "intranet"
+_OVERLAY_ROOT: Traversable = resources.files("octop.i18n").joinpath("intranet")
 
 def deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
     """New dict: nested mappings merge recursively; otherwise the overlay value wins.
@@ -216,22 +215,15 @@ def deep_merge(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str,
     Neither argument is mutated.
     """
 
-def _overlay_root() -> Traversable:
-    return resources.files("octop.i18n").joinpath(OVERLAY_DIR)
-
 def read_overlay(locale: str) -> dict[str, Any]:
-    """Parse ``_overlay_root() / f"{locale}.json"`` (``octop/i18n/intranet/<locale>.json``).
+    """Parse ``_OVERLAY_ROOT / f"{locale}.json"`` (``octop/i18n/intranet/<locale>.json``).
 
     Missing file / invalid JSON propagate; a non-object top level raises ``ValueError``.
     """
-
-def with_overlay(base: dict[str, Any], locale: str) -> dict[str, Any]:
-    return deep_merge(base, read_overlay(locale))
 ```
 
 - 只依赖标准库，不导入 `loader`，因此没有循环导入。按 AGENTS.md §5，`octop.i18n` 可以依赖标准库与 `infra/utils/locale`，本模块符合要求。
-- `with_overlay` 在 `_load_all` 内部被调用，结果随 `lru_cache` 缓存；测试需要替换 overlay 时，monkeypatch `octop.i18n.overlay.read_overlay`，并在前后各调用一次 `_load_all.cache_clear()`。
-- `_overlay_root` 单独成函数，便于测试把它 monkeypatch 到 `tmp_path` 来构造缺失、非法、非对象三种文件，而不用去改全局的 `importlib.resources.files`。`Traversable` 来自 `importlib.resources.abc`。
+- `_load_all` 直接调用 `deep_merge(json.loads(raw), read_overlay(loc))`，结果随 `lru_cache` 缓存；测试需要替换 overlay 时，把 `octop.i18n.overlay._OVERLAY_ROOT` monkeypatch 到 `tmp_path` 并写入真实文件（探针、缺失、非法、非对象都走同一条读取路径），前后各调用一次 `_load_all.cache_clear()`。`Traversable` 来自 `importlib.resources.abc`。
 
 ### `dashboard/src/i18nIntranet.ts`（新增）
 
@@ -270,15 +262,15 @@ import { applyIntranetOverlay } from "./i18nIntranet";            // 新增
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DASHBOARD_LOCALES = REPO_ROOT / "dashboard" / "src" / "locales"
 DASHBOARD_OVERLAY_DIR = DASHBOARD_LOCALES / "intranet"
-BACKEND_OVERLAY_DIR = REPO_ROOT / "src" / "octop" / "i18n" / "intranet"
 
-def read_json_object(path: Path) -> dict[str, Any]: ...
+def read_json(path: Path) -> Any: ...
 def merged_backend_bundle(locale: Locale) -> dict[str, Any]:
-    """``copy.deepcopy(_load_all()[locale])`` — exactly what the server serves."""
+    """``_load_all()[locale]`` — exactly what the server serves."""
 def merged_dashboard_bundle(locale: Locale) -> dict[str, Any]:
     """``deep_merge(<locales>/<locale>.json, <locales>/intranet/<locale>.json)``."""
-def shape_conflicts(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> list[str]: ...
 ```
+
+形状冲突检查只有 `test_intranet_overlay.py` 一处使用，写成该文件内的私有函数。
 
 叶子键集直接复用 `octop.i18n.loader.flatten_keys`，不另写一份。三个上游测试文件的改动都是把 `json.loads((repo / …).read_text(…))` 换成 `merged_dashboard_bundle("en")` / `merged_backend_bundle("en")`，断言本身不变。`test_dashboard_api_errors_use_i18next_placeholders` 的循环改为读 `merged_dashboard_bundle(locale)["apiErrors"]`。
 
@@ -294,25 +286,20 @@ Physically deleted routers must instead drop their import + _RouterMount line.
 
 _FORK_DISABLED_MOUNTS: frozenset[str] = frozenset()
 
-class _HasRouter(Protocol):
-    @property
-    def router(self) -> Any: ...
-
-_M = TypeVar("_M", bound=_HasRouter)
-
 def resolve_router_ref(ref: str) -> APIRouter:
-    """Import ``module`` and return ``attribute``; RuntimeError on bad syntax or non-APIRouter.
+    """``ref.partition(":")`` → import module, getattr attribute; TypeError on non-APIRouter.
 
-    ImportError / AttributeError propagate unchanged (fail closed at build_app).
+    ImportError / AttributeError propagate unchanged (fail closed at build_app); a
+    missing ``:`` becomes ``getattr(module, "")`` → AttributeError.
     """
 
-def without_fork_disabled(mounts: Sequence[_M]) -> list[_M]:
+def without_fork_disabled(mounts: Sequence[_RouterMount]) -> list[_RouterMount]:
     """``mounts`` minus those whose ``router`` is (by identity) a disabled router."""
 ```
 
 - `app.py` 中 `_mount_routers` 的循环头由 `for spec in mounts:` 改为 `for spec in without_fork_disabled(mounts):`。
 - import 行按 ruff isort 顺序放在 `octop.api.middleware…` 之前。
-- 协议里用 `@property`，是因为 `_RouterMount` 是 frozen dataclass，只读属性不满足可写的协议成员，mypy strict 会报错。
+- `_RouterMount` 只在 `TYPE_CHECKING` 下从 `octop.api.app` 导入，运行期没有循环导入，也不需要额外的协议类型。
 
 ### `src/octop/infra/connectors/catalog_intranet.py`（新增）
 
@@ -340,14 +327,16 @@ def compose_catalog(base: tuple[ConnectorCatalogEntry, ...]) -> tuple[ConnectorC
 `catalog.py` 的改动：
 
 ```python
+from octop.infra.connectors.catalog_intranet import compose_catalog  # 文件头 import 块
+
 _BASE: tuple[ConnectorCatalogEntry, ...] = (      # ≈L96，原名 _CATALOG
     …                                              # 23 条上游条目，一行不动
 )
 
-from octop.infra.connectors.catalog_intranet import compose_catalog  # noqa: E402
-
-_CATALOG: tuple[ConnectorCatalogEntry, ...] = compose_catalog(_BASE)
+_CATALOG = compose_catalog(_BASE)
 ```
+
+`catalog_intranet` 在模块级不导入 `catalog`，所以 import 放在文件头即可，不需要 `# noqa: E402`。
 
 - `mcp_oauth_remote_kinds`、`list_catalog`、`get_catalog_entry` 都在调用时读取模块全局 `_CATALOG`，一行都不用改。
 - `_FORK_REMOVED` 引用了不存在的 kind、合成后 kind 重复，这两类错误不在运行时校验，由单测在同步时拦截，理由见"错误处理"。
@@ -355,8 +344,6 @@ _CATALOG: tuple[ConnectorCatalogEntry, ...] = compose_catalog(_BASE)
 ### `Makefile.intranet` 的 `relock` 目标（追加）
 
 ```make
-PYPI_INDEX ?=
-
 .PHONY: relock
 relock:
 	@command -v uv >/dev/null 2>&1 || { echo "[relock] uv is required (pip cannot write uv.lock)"; exit 2; }
@@ -366,7 +353,7 @@ relock:
 	@cd $(DASHBOARD_DIR) && npm install --package-lock-only --ignore-scripts --no-audit --no-fund $(if $(strip $(NPM_REGISTRY)),--registry=$(strip $(NPM_REGISTRY)),)
 ```
 
-- `help-intranet` 增加一行：`relock  regenerate uv.lock + dashboard/package-lock.json (PYPI_INDEX=<url> NPM_REGISTRY=<url>)`。
+- `help-intranet` 增加两行，列出 `relock` 与 `PYPI_INDEX=<url> NPM_REGISTRY=<url>`。不写 `PYPI_INDEX ?=`：未定义的 make 变量本来就展开为空（与 `w0-02` 对 `NPM_REGISTRY` 的处理一致）。
 - `DASHBOARD_DIR` 由根 `Makefile` 定义，被 include 的文件可以直接使用。
 - 在 make 的语义下，命令行变量与环境变量都会被 `?=` 接受。`make -n` 会展开 `@` 行，可以用来离线验证参数拼装。
 
@@ -525,13 +512,13 @@ relock:
 
 | 类别 | 用例 | 本地命令 |
 |---|---|---|
-| 单测：后端 overlay | `tests/unit/i18n/test_intranet_overlay.py`：`deep_merge` 语义与不修改入参；替身 overlay 下 `tr` / `lookup` / `all_keys_for_locale` / `all_tool_labels` / `all_skill_labels` 取到 overlay 值；缺文件、非法 JSON、非对象三种异常；`importlib.resources` 能找到两份 overlay；两对 overlay 的 en == zh 叶子键集；两对 overlay 与上游的形状冲突 | `uv run pytest tests/unit/i18n -q` |
+| 单测：后端 overlay | `tests/unit/i18n/test_intranet_overlay.py`：`deep_merge` 语义与不修改入参；替身 overlay 下 `tr` / `lookup` / `all_keys_for_locale` / `all_tool_labels` / `all_skill_labels` 取到 overlay 值；缺文件、非法 JSON、非对象三种情形下首次 `_load_all()` 抛异常（`importlib.resources` 找不到 overlay 时全部 i18n 用例都会失败，不再单写打包用例）；两对 overlay 的 en == zh 叶子键集；两对 overlay 与上游的形状冲突 | `uv run pytest tests/unit/i18n -q` |
 | 单测：门禁改读合并 bundle | `test_errors.py`、`test_tools.py`、`test_skills.py` 改用 `tests/support/i18n_bundles.py`；另在 `test_intranet_overlay.py` 中用替身 dashboard overlay 调用 `merged_dashboard_bundle`，证明合并确实生效 | 同上 |
-| 单测：路由下线 | `tests/unit/api/test_intranet_mounts.py`：`without_fork_disabled` 在空集下原样返回；monkeypatch 为 `{"octop.api.routers.search:router"}` 后 `build_app` 的 `app.routes` 与 `/api/openapi.json`（`enable_api_docs=True`）中都没有 `/api/search/{provider_id}/test`；非法引用（缺冒号、模块不存在、属性不存在、非 APIRouter）时 `build_app` 抛异常；对已登记的每一项，清空集合后其路径出现在 `app.routes` 中 | `uv run pytest tests/unit/api/test_intranet_mounts.py -q` |
-| 单测：连接器目录 | `tests/unit/connectors/test_catalog_intranet.py`：`list_catalog()` 等于 `[e for e in _BASE if e.kind not in _FORK_REMOVED] + list(_fork_entries())`；`_FORK_REMOVED ⊆ {e.kind for e in _BASE}`；合成后 kind 唯一；monkeypatch 删除集与追加项后 `compose_catalog` 的过滤与追加顺序正确；子进程按"先 catalog_intranet 后 catalog"与"先 catalog 后 catalog_intranet"两种顺序导入都成功（`subprocess.run([sys.executable, "-c", …])`，与平台无关） | `uv run pytest tests/unit/connectors/test_catalog_intranet.py tests/unit/test_connectors.py -q` |
-| 集成：i18n API | `tests/integration/test_intranet_overlay_api.py`：用 `env` fixture 与后端探针 overlay，带 `Accept-Language: zh` 请求 `GET /api/i18n/tools` 与 `GET /api/i18n/skills`，断言返回探针值 | `uv run pytest tests/integration/test_intranet_overlay_api.py -q` |
-| 集成：连接器目录 | `tests/integration/test_connectors_catalog_intranet.py`：用 `env` fixture，monkeypatch `octop.infra.connectors.catalog._CATALOG` 为合成结果后，`GET /api/connectors/catalog` 不含被删 kind、含追加 kind 且排在最后；回归既有 `test_connectors_api.py` 与 `test_scalar.py` | `uv run pytest tests/integration/test_connectors_catalog_intranet.py tests/integration/test_connectors_api.py tests/integration/test_scalar.py -q` |
-| 契约 | `tests/unit/test_fork_isolation_contract.py`：`i18n.ts` 从 `./i18nIntranet` 导入且 `applyIntranetOverlay(` 不少于 2 处；`Makefile.intranet` 以行首 `relock:` 定义目标，且 `help-intranet` 提到 `relock`；`docs/api.md` 前 5 行含 `api-intranet.md` | `uv run pytest tests/unit/test_fork_isolation_contract.py -q` |
+| 单测：路由下线 | `tests/unit/api/test_intranet_mounts.py`：`without_fork_disabled` 在空集下原样返回；对 `_FORK_DISABLED_MOUNTS ∪ {"octop.api.routers.search:router"}` 的每一项参数化：空集下构建一次、只登记该项再构建一次，比较两次 `app.openapi()["paths"]`（即 `/api/openapi.json` 的内容），前者多出的路径非空（登记项确实会被挂载）、`/api/auth/login` 仍在，search 恰好少了 `/api/search/{provider_id}/test`；非法引用（缺冒号、模块不存在、属性不存在、非 APIRouter）时 `build_app` 抛异常。`build_app` 用 `SimpleNamespace(services=None)` 作替身 server，不启动 `OctopServer`；FastAPI 0.138 的 `app.routes` 里是 `_IncludedRouter` 包装，所以按路径比对走 OpenAPI | `uv run pytest tests/unit/api/test_intranet_mounts.py -q` |
+| 单测：连接器目录 | `tests/unit/connectors/test_catalog_intranet.py`：`list_catalog()` 等于 `[e for e in _BASE if e.kind not in _FORK_REMOVED] + list(_fork_entries())`；`_FORK_REMOVED ⊆ {e.kind for e in _BASE}`；合成后 kind 唯一；子进程先导入 `catalog_intranet` 并改写 `_FORK_REMOVED = {"notion"}` 与 `_fork_entries`（函数内导入 `_BASE` 构造 `bank-probe`），再导入 `catalog`，断言 `list_catalog()`、`get_catalog_entry`、`mcp_oauth_remote_kinds()` 反映删除与追加——只 monkeypatch `_CATALOG` 的写法在钩子丢失时仍会通过，子进程写法才守得住合成钩子；另一个子进程按"先 catalog 后 catalog_intranet"导入并调用 `list_catalog()`（`subprocess.run([sys.executable, "-c", …])`，与平台无关） | `uv run pytest tests/unit/connectors/test_catalog_intranet.py tests/unit/test_connectors.py -q` |
+| 单测：i18n API | 并入 `test_intranet_overlay.py` 的探针用例：两个路由不依赖鉴权与 server，用裸 `FastAPI` 挂 `octop.api.routers.i18n.router`，带 `Accept-Language: zh` 请求 `GET /api/i18n/tools` 与 `GET /api/i18n/skills`，断言返回探针值 | `uv run pytest tests/unit/i18n -q` |
+| 集成：连接器目录 | `tests/integration/test_connectors_catalog_intranet.py`：用 `env` fixture，monkeypatch `octop.infra.connectors.catalog._CATALOG` 为合成结果后，`GET /api/connectors/catalog` 不含被删 kind、含追加 kind 且排在最后（只验 API 读的是 `_CATALOG`）；回归既有 `test_connectors_api.py` 与 `test_scalar.py` | `uv run pytest tests/integration/test_connectors_catalog_intranet.py tests/integration/test_connectors_api.py tests/integration/test_scalar.py -q` |
+| 契约 | `tests/unit/test_fork_isolation_contract.py`：`i18n.ts` 从 `./i18nIntranet` 导入且 `applyIntranetOverlay(` 不少于 2 处；`Makefile.intranet` 以行首 `relock:` 定义目标，且 `help-intranet` 有 `relock` 一行；`docs/api.md` 前 5 行含 `api-intranet.md`。写成一个按（文件、正则、最少次数）参数化的用例 | `uv run pytest tests/unit/test_fork_isolation_contract.py -q` |
 | 前端 | `dashboard/src/i18nIntranet.test.ts`：`vi.mock` 两份 overlay JSON（覆盖 `common.save`，新增 `intranetProbe.hello`）；在 `localStorage` 中写入 `UI_LOCALE_STORAGE_KEY = "en"` 后 `await initI18n()`，断言 en 覆盖生效、`common.reset` 仍是上游值；`await ensureLocaleBundle("zh")` 后断言 zh 覆盖生效，且 `common.reset` 等于上游 zh 的值（静态导入 `./locales/zh.json` 取期望值） | `cd dashboard && npx tsc -b && npm run lint && npm run test -- src/i18nIntranet.test.ts`，或 `make check-frontend` |
 | 打包 | wheel 中包含两份后端 overlay | `d=$(mktemp -d) && uv build --wheel -o "$d" && uv run python -c "import sys,glob,zipfile; n=set(zipfile.ZipFile(glob.glob(sys.argv[1]+'/*.whl')[0]).namelist()); assert {'octop/i18n/intranet/en.json','octop/i18n/intranet/zh.json'} <= n; print('wheel-ok')" "$d"` |
 | relock | 参数拼装与幂等 | 见表后命令 |

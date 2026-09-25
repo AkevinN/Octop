@@ -7,6 +7,7 @@ from functools import lru_cache
 from importlib import resources
 from typing import Any
 
+from octop.i18n.overlay import deep_merge, read_overlay
 from octop.infra.utils.locale import Locale, normalize_locale
 
 _FALLBACK_LOCALE: Locale = "en"
@@ -26,7 +27,7 @@ def _load_all() -> dict[Locale, dict[str, Any]]:
     out: dict[Locale, dict[str, Any]] = {}
     for loc in ("en", "zh"):
         raw = resources.files("octop.i18n").joinpath(f"{loc}.json").read_text(encoding="utf-8")
-        out[loc] = json.loads(raw)
+        out[loc] = deep_merge(json.loads(raw), read_overlay(loc))
     return out
 
 

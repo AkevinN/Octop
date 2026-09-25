@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
+from tests.support.i18n_bundles import merged_backend_bundle, merged_dashboard_bundle
 
 from octop.i18n import all_skill_labels, skill_display_name
 
@@ -35,8 +34,7 @@ def test_all_skill_labels_includes_pdf():
 
 
 def test_dashboard_skill_labels_match_backend():
-    repo = Path(__file__).resolve().parents[3]
-    dash_en = json.loads((repo / "dashboard/src/locales/en.json").read_text(encoding="utf-8"))
-    backend_en = json.loads((repo / "src/octop/i18n/en.json").read_text(encoding="utf-8"))
+    dash_en = merged_dashboard_bundle("en")
+    backend_en = merged_backend_bundle("en")
     for slug, label in backend_en["skills"].items():
         assert dash_en["skills"][slug] == label

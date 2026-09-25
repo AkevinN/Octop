@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from octop.infra.connectors.catalog_intranet import compose_catalog
+
 AuthKind = Literal[
     "personal_token",
     "oauth2",
@@ -93,7 +95,7 @@ def get_mcp_oauth_remote(kind: str) -> ConnectorCatalogEntry | None:
     return entry
 
 
-_CATALOG: tuple[ConnectorCatalogEntry, ...] = (
+_BASE: tuple[ConnectorCatalogEntry, ...] = (
     ConnectorCatalogEntry(
         kind="tencent-docs",
         name="腾讯文档",
@@ -529,6 +531,8 @@ _CATALOG: tuple[ConnectorCatalogEntry, ...] = (
         remote_transport="streamable_http",
     ),
 )
+
+_CATALOG = compose_catalog(_BASE)
 
 
 def list_catalog() -> list[ConnectorCatalogEntry]:
