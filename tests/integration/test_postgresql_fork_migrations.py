@@ -103,7 +103,10 @@ def test_pg_restore_resets_watermark_from_manifest(
     system_archive.create_system_backup(
         paths=layout, agent_rows=[], pool=pool, db_config=db_config, dest=archive
     )
-    write_demo_fork_migrations(fork_dir, (2,))
+    # FK-free on purpose: a fork FK onto a dumped upstream table breaks pg_restore --clean.
+    (fork_dir / "fork002_demo_ref.pg.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS fork_demo_ref (id BIGINT PRIMARY KEY);\n", encoding="utf-8"
+    )
     run_migrations(pool)  # live watermark now 2; pg_restore --clean may keep it
 
     resets: list[int] = []

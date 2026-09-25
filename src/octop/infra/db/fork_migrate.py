@@ -69,9 +69,14 @@ def _ensure_version_table(conn: Any) -> None:
     )
 
 
-def _read_version(conn: Any, suffix: str = "") -> int:
-    row = conn.execute(f"SELECT version FROM _fork_schema_version WHERE id = 1{suffix}").fetchone()
-    return int(row[0]) if row is not None else 0
+def _read_version(conn: Any) -> int:
+    return int(conn.execute("SELECT version FROM _fork_schema_version WHERE id = 1").fetchone()[0])
+
+
+def _lock(conn: Any, dialect: str) -> None:
+    # Transaction-scoped: concurrent upgraders queue here, including before the first CREATE TABLE.
+    if dialect == "postgresql":
+        conn.execute("SELECT pg_advisory_xact_lock(7302461)")
 
 
 def current_fork_version(db: DatabasePool) -> int:
@@ -88,11 +93,12 @@ def set_fork_version(db: DatabasePool, version: int) -> None:
 
 
 def run_fork_migrations(db: DatabasePool) -> None:
-    with db.transaction() as conn:
-        _ensure_version_table(conn)
     migrations = discover_fork_migrations(db.dialect)
     latest = migrations[-1][0] if migrations else 0
-    current = current_fork_version(db)
+    with db.transaction() as conn:
+        _lock(conn, db.dialect)
+        _ensure_version_table(conn)
+        current = _read_version(conn)
     if current > latest:
         logger.warning(
             "fork schema version %d is newer than the latest fork migration %d in this build; "
@@ -101,12 +107,12 @@ def run_fork_migrations(db: DatabasePool) -> None:
             latest,
         )
         return
-    lock = " FOR UPDATE" if db.dialect == "postgresql" else ""
     for version, path in migrations:
         if version <= current:
             continue
         with db.transaction() as conn:
-            if _read_version(conn, lock) >= version:
+            _lock(conn, db.dialect)
+            if _read_version(conn) >= version:
                 continue
             for stmt in _split_pg_sql(path.read_text(encoding="utf-8")):
                 conn.execute(stmt)

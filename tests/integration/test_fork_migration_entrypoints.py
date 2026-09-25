@@ -11,6 +11,7 @@ from octop.cli.commands.init import init
 from octop.cli.support.db import open_cli_services
 from octop.config import DatabaseConfig
 from octop.infra.db.fork_migrate import current_fork_version
+from octop.infra.db.migrate import _table_exists
 from octop.infra.db.pool import SqlitePool
 from octop.infra.db.rebind import (
     assert_control_plane_database_empty,
@@ -47,6 +48,7 @@ async def test_server_bind_rebind_and_restart(tmp_octop_home: Path, fork_dir: Pa
     async with octop_client(tmp_octop_home) as (_client, srv):  # existing DB: start()
         assert srv.services is not None
         assert current_fork_version(srv.services.db) == 2
+        assert _table_exists(srv.services.db, "fork_demo_ref")
 
 
 def test_offline_entrypoints(tmp_path: Path, fork_dir: Path) -> None:

@@ -220,9 +220,9 @@ New agents additionally keep system-scoped files under `{workspace}/.octop/` (e.
 
 **Database:** SQLite and PostgreSQL share one schema. Add or change tables via a numbered pair
 `infra/db/migrations/00N_description.sql` **and** `00N_description.pg.sql`, then bump every
-`_schema_version` assertion (currently `15`, spread over 8 test files under `tests/unit/db/` plus
-`tests/unit/backup/test_system_archive.py`; the mid-upgrade `== 7` in `test_db_pool.py` is not a
-watermark assertion). Rebuilds that SQLite
+`_schema_version` assertion (currently `15`, spread over 8 test files: 7 under `tests/unit/db/`
+plus `tests/unit/backup/test_system_archive.py`; the mid-upgrade `== 7` in `test_db_pool.py` is not
+a watermark assertion). Rebuilds that SQLite
 cannot express as `ALTER` live in `infra/db/migrate.py` helpers and must stay idempotent.
 
 Unreleased schema work on `develop` **folds into the current unreleased `00N`**, not a new
@@ -241,10 +241,12 @@ Write schema changes as `infra/db/migrations/forkNNN_description.sql` **and**
 fork work. Specs write `forkNNN_<description>`; take the next free number when merging into the
 fork mainline, and never edit a merged fork file (fix forward with a new number). Each file runs
 in one transaction together with its watermark bump: no `BEGIN`/`COMMIT`, end statements with
-`;` + newline, no triggers, no `?` inside literals; in `.pg.sql`, `CREATE TABLE` / `CREATE INDEX`
-/ `ADD COLUMN` use `IF NOT EXISTS` and inserts must be idempotent. Backfills SQL cannot express
-portably, or that must guard a missing upstream table, go in an idempotent Python step registered
-in `_FORK_PY_STEPS`. Never fold fork schema into `_repair_legacy_schema`, `_ensure_*` helpers,
+`;` + newline, no `$$` bodies (DO blocks, functions, triggers), no `?` inside literals; in
+`.pg.sql`, `CREATE TABLE` / `CREATE INDEX` / `ADD COLUMN` use `IF NOT EXISTS` and inserts must be
+idempotent. Backfills SQL cannot express portably, idempotent PG constraints, or changes that must
+guard a missing upstream table go in an idempotent Python step registered in `_FORK_PY_STEPS`.
+A fork FK onto an upstream table makes `pg_restore --clean` of an older backup skip that upstream
+table (exit code 1 is only logged), so restore such backups into an empty schema. Never fold fork schema into `_repair_legacy_schema`, `_ensure_*` helpers,
 `_apply_sqlite_migration`, or the `_reconcile_pre_squash_schema_version` ladder.
 
 Resource tables (API-visible entities: `agents`, `channels`, `threads`, `cron_jobs`,

@@ -107,11 +107,11 @@ fork 命名空间逐条消除这三点：
 
 `run_fork_migrations(db)` 的步骤：
 
-1. `_ensure_fork_version_table(db)`：执行 `CREATE TABLE IF NOT EXISTS _fork_schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`，再执行 `INSERT INTO _fork_schema_version(id, version) VALUES (1, 0) ON CONFLICT (id) DO NOTHING`。SQLite 3.24+ 与 PG 系都支持这一写法。
+1. `_ensure_fork_version_table(db)`：执行 `CREATE TABLE IF NOT EXISTS _fork_schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`，再执行 `INSERT INTO _fork_schema_version (id, version) SELECT 1, 0 WHERE NOT EXISTS (SELECT 1 FROM _fork_schema_version)`。不用 `ON CONFLICT`，是为了让 GaussDB 等不支持该语法的 PG 系库也能执行。PG 方言下，这个事务先取 `pg_advisory_xact_lock`，防止并发首次升级时 `CREATE TABLE IF NOT EXISTS` 撞上 `pg_type` 唯一键（实测不加锁时两个进程并发 10/10 复现）。
 2. `migrations = discover_fork_migrations(db.dialect)`，`max_v` 取最大版本，没有文件时为 0。
 3. 读取 `current = current_fork_version(db)`。如果 `current > max_v`，记一条 WARNING（含两个数字）后直接返回，不改水位，不执行文件。这是为了防止程序回退后再升级时重复执行已应用的迁移。
 4. 对每个 `version > current` 的迁移，在 `with db.transaction() as conn:` 内依次完成：
-   - 重读水位（PG 加 `FOR UPDATE` 锁住这一行，防止两个进程同时迁移）；如果已经 `>= version` 就跳过；
+   - PG 方言先取同一把 `pg_advisory_xact_lock`，再重读水位，防止两个进程同时迁移；如果已经 `>= version` 就跳过；
    - 用 `_split_pg_sql` 切分文件，逐条 `conn.execute(stmt)`；
    - 若 `_FORK_PY_STEPS` 登记了该版本的步骤，调用 `step(conn, db.dialect)`；
    - 执行 `UPDATE _fork_schema_version SET version = ? WHERE id = 1`。
@@ -122,7 +122,7 @@ fork 命名空间逐条消除这三点：
 
 - 不写 `BEGIN` / `COMMIT`，因为 runner 已经开了事务。
 - 语句以 `;` + 换行结束。
-- 不写触发器：触发器体里的 `;` + 换行会被切分器切断。确实需要触发器时，改用 Python 步骤整条执行。
+- 不写任何 `$$` 函数体（DO 块、函数、触发器）：体内的 `;` + 换行会被切分器切断。确实需要时（包括 PG 上幂等地加约束），改用 Python 步骤整条执行。
 - 字面量里不出现 `?`：PG 代理会把它改写成 `%s`。
 - `.pg.sql` 里的 `CREATE TABLE` / `CREATE INDEX` / `ADD COLUMN` 一律带 `IF NOT EXISTS`，`INSERT` 用 `ON CONFLICT DO NOTHING`。这与上游 `.pg.sql` 的一贯写法一致（如 `015_sso_provider_kind.pg.sql`），并保证 PG 恢复后重放不失败（见"备份与恢复"）。
 - SQLite 的 `ALTER TABLE … ADD COLUMN` 没有 `IF NOT EXISTS` 语法。runner 的事务保证它只会被成功执行一次；SQLite 恢复会整库覆盖，不会留下残余列。
@@ -177,11 +177,11 @@ fork 命名空间逐条消除这三点：
 
 1. 把 ≈L222-223 的 "then bump the version assertion in `tests/unit/db/test_db_pool.py` (currently `v == 7`)" 改为：
 
-   > then bump every `_schema_version` assertion (currently `15`, spread over 8 test files under `tests/unit/db/` plus `tests/unit/backup/test_system_archive.py`; the mid-upgrade `== 7` in `test_db_pool.py` is not a watermark assertion)
+   > then bump every `_schema_version` assertion (currently `15`, spread over 8 test files: 7 under `tests/unit/db/` plus `tests/unit/backup/test_system_archive.py`; the mid-upgrade `== 7` in `test_db_pool.py` is not a watermark assertion)
 
 2. 在 ≈L232 之后新增一段：
 
-   > **Fork migrations (intranet fork only):** never add an upstream-numbered `NNN_` file in this fork. Write schema changes as `infra/db/migrations/forkNNN_description.sql` **and** `forkNNN_description.pg.sql`. They are invisible to `_discover` and are applied by `run_fork_migrations()` (`infra/db/fork_migrate.py`), the last call in `run_migrations()`, against their own `_fork_schema_version` watermark — `_schema_version` and its test assertions never change for fork work. Specs write `forkNNN_<description>`; take the next free number when merging into the fork mainline. A merged fork file is immutable: fix forward with a new number. Each file runs in one transaction with its watermark bump: no `BEGIN`/`COMMIT`, end statements with `;` + newline, no triggers, no `?` inside literals; `.pg.sql` must use `IF NOT EXISTS` / `ON CONFLICT DO NOTHING`. Backfills that SQL cannot express portably, or that must guard against a missing upstream table, go in an idempotent Python step registered in `_FORK_PY_STEPS`. Never fold fork schema into `_repair_legacy_schema`, `_ensure_*` helpers, `_apply_sqlite_migration`, or the `_reconcile_pre_squash_schema_version` ladder.
+   > **Fork migrations (intranet fork only):** never add an upstream-numbered `NNN_` file in this fork. Write schema changes as `infra/db/migrations/forkNNN_description.sql` **and** `forkNNN_description.pg.sql`. They are invisible to `_discover` and are applied by `run_fork_migrations()` (`infra/db/fork_migrate.py`), the last call in `run_migrations()`, against their own `_fork_schema_version` watermark — `_schema_version` and its test assertions never change for fork work. Specs write `forkNNN_<description>`; take the next free number when merging into the fork mainline. A merged fork file is immutable: fix forward with a new number. Each file runs in one transaction with its watermark bump: no `BEGIN`/`COMMIT`, end statements with `;` + newline, no `$$` bodies, no `?` inside literals; `.pg.sql` must use `IF NOT EXISTS` and idempotent inserts. Backfills that SQL cannot express portably, or that must guard against a missing upstream table, go in an idempotent Python step registered in `_FORK_PY_STEPS`. Never fold fork schema into `_repair_legacy_schema`, `_ensure_*` helpers, `_apply_sqlite_migration`, or the `_reconcile_pre_squash_schema_version` ladder.
 
 §5 / §9 的勘误不在本 spec 内（归 `w0-04`），以免两个 spec 同时改这个文件的同一区域。
 
@@ -327,7 +327,7 @@ make all
   2. 核对上游新增的 `NNN_` 迁移，看是否与 fork 已建的表或列同名。
 
   另外，在 `CHANGELOG-intranet.md` 建立时补录本 spec 的条目。
-- **`p2-08`（单活租约）：** 迁移应当在拿到租约之后执行。runner 的 PG `FOR UPDATE` 只是兜底，不能替代租约。
+- **`p2-08`（单活租约）：** 迁移应当在拿到租约之后执行。runner 的 PG advisory lock 只是兜底，不能替代租约。
 - **`w4-02`（运维最小集）：** 升级与回滚手册中写明两点：用 `SELECT version FROM _fork_schema_version` 检查 fork 水位；PG 恢复优先恢复到空 schema（原因见风险）。
 
 **看似相关、实际归别的 spec：**
@@ -349,14 +349,15 @@ make all
 | 上游同步解冲突时丢掉 `run_migrations` 末尾的 fork 调用 | fork 迁移静默不执行 | AST 守卫与行为用例让 `make test` 直接变红；`w0-04` 的同步手册单列检查项 |
 | 上游以后新增与 fork 同名的表或列 | 上游 `NNN_` 迁移报"已存在"，实例起不来 | 同步手册核对上游新迁移；fork 新表建议用领域前缀命名（由各 spec 自定） |
 | PG `pg_restore --clean` 不删除转储之外的对象：恢复旧包后，较新 fork 迁移建的表连同其中的数据会残留 | `.pg.sql` 若没写 `IF NOT EXISTS` 会重放失败；残留行是恢复点之后的数据 | 静态测试强制 `.pg.sql` 使用 `IF NOT EXISTS`；恢复后水位按 manifest 重置；`w4-02` 的运维手册要求 PG 恢复到空 schema。这是上游 PG 恢复的既有语义，本 spec 不改 `pg_dump.py` |
+| fork 表外键指向上游表时，PG `pg_restore --clean` 恢复更早的备份 | 被引用的上游表删不掉、也重建不了，`pg_restore` 退出码 1 只记日志，该表静默保留现库数据（评审实测） | AGENTS.md fork 规则写明须恢复到空 schema；`w4-02` 运维手册同步；让恢复在退出码 1 时失败属于 `pg_dump.py`，不在本 spec 范围 |
 | fork 迁移号按合入顺序确定，开发者本地库可能已用改号前的号码跑过 | 本地库跳过真正的 `forkNNN` | 仅影响开发环境；AGENTS.md 写明"合入后不可改"，改号后重建本地库 |
 | 后续 fork 迁移 `ALTER` 上游表，碰上测试里的 users-only 残缺库 | 既有用例变红 | 交接中要求用 Python 步骤配合 `_table_exists` 守卫 |
 | SQLite 事务内不能切换 `PRAGMA foreign_keys` | 需要关外键重建表的迁移无法通过 runner 执行 | 写明为 runner 限制，遇到时由提出方 spec 单独评审 |
-| 多进程同时首次升级（CLI 离线命令与服务同时启动） | SQLite 出现 `database is locked`，或 PG 重复执行 | 事务内重读水位；PG 用 `FOR UPDATE`；与上游迁移的并发语义一致 |
+| 多进程同时首次升级（CLI 离线命令与服务同时启动） | SQLite 出现 `database is locked`，或 PG 重复执行 | 事务内重读水位；PG 用 `pg_advisory_xact_lock` 串行化（含首次建表）；SQLite 与上游迁移的并发语义一致 |
 
 **回滚：** 本 spec 的全部改动都是增量的，也不提交任何 fork 迁移文件，因此回滚就是 `git revert` 对应提交。已经建出的 `_fork_schema_version` 表对上游代码无害（未知表会被忽略，备份会带上它）。如果之后已有 spec 基于本 runner 提交了 fork 迁移，需要先回滚那些 spec，再回滚本 spec。
 
 ## 待行方确认
 
-- **D3（控制面数据库）：** 默认 PG 系（人大金仓或 openGauss）。runner 依赖以下能力：事务化 DDL、`CREATE TABLE IF NOT EXISTS`、`INSERT … ON CONFLICT (id) DO NOTHING/UPDATE`、`SELECT … FOR UPDATE`，PG 系都支持。若答复为达梦 / OceanBase / TiDB，fork 发现需要识别第三种后缀，这属于 D3 的另立项范围。
+- **D3（控制面数据库）：** 默认 PG 系（人大金仓或 openGauss）。runner 依赖以下能力：事务化 DDL、`CREATE TABLE IF NOT EXISTS`、`INSERT … SELECT … WHERE NOT EXISTS`、`pg_advisory_xact_lock`。若答复为达梦 / OceanBase / TiDB，fork 发现需要识别第三种后缀，这属于 D3 的另立项范围。
 - **D7（长期 fork）：** 独立迁移空间以"长期 fork、每 2–4 个上游 release 同步一次"为前提。若改为一次性冻结、不再跟随上游，本机制仍然成立，只是同步手册中的检查项可以删除。

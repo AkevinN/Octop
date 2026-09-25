@@ -104,16 +104,6 @@ def test_watermark_table_is_single_row(pool: SqlitePool) -> None:
             conn.execute("INSERT INTO _fork_schema_version (id, version) VALUES (2, 0)")
 
 
-def test_runner_applies_pending_versions_without_touching_upstream(pool: SqlitePool) -> None:
-    with pool.connect() as conn:
-        conn.execute("DROP TABLE _fork_schema_version")
-    run_fork_migrations(pool)
-    assert current_fork_version(pool) == 2
-    assert _table_exists(pool, "fork_demo")
-    assert _table_exists(pool, "fork_demo_ref")
-    assert _current_version(pool) == UPSTREAM_MAX
-
-
 def test_runner_is_idempotent(pool: SqlitePool, monkeypatch: pytest.MonkeyPatch) -> None:
     run_fork_migrations(pool)
 
